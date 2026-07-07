@@ -1,0 +1,16 @@
+# data.yaml 예시 — 복사 후 경로와 클래스를 본인 데이터셋에 맞게 수정하세요.
+#
+# 사용법:
+#   cp dataset/data.yaml.example dataset/data.yaml
+#   # train/val 폴더와 라벨을 직접 준비
+#   python3 train_yolo.py --data dataset/data.yaml
+
+path: /home/cook2/mini_prj/mini_prj_1/yh/pinky_pro/dataset
+train: train/images
+val: val/images
+
+names:
+  0: apple
+  1: banana
+  2: orange
+  3: carrot
