@@ -15,14 +15,14 @@ from pathlib import Path
 from ultralytics import YOLO
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_PATH = SCRIPT_DIR / 'yolov8n.pt'
+DEFAULT_MODEL_PATH = SCRIPT_DIR / 'yolo11n.pt'
 DEFAULT_STREAM_URL = 'http://192.168.4.1:5000/video'
 DEFAULT_SCREENSHOT_DIR = SCRIPT_DIR / 'screenshots'
 AUTO_SCREENSHOT_INTERVAL_SEC = 5.0
 WINDOW_NAME = 'Pinky YOLOv8 Stream Detection'
 CONTROL_WINDOW_NAME = 'Pinky YOLO Controls'
 
-CONFIDENCE_THRESHOLD = 0.45
+CONFIDENCE_THRESHOLD = 0.2
 IOU_THRESHOLD = 0.6
 IMAGE_SIZE = 640
 MAX_DETECTIONS = 300
