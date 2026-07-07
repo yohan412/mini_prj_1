@@ -139,18 +139,26 @@ def parse_args():
     default=str(DEFAULT_SCREENSHOT_DIR),
     help='Directory to save screenshots',
   )
+  parser.add_argument(
+    '--yolo',
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help='Enable YOLO detection (use --no-yolo to show raw stream only)',
+  )
   return parser.parse_args()
 
 
 def main():
   args = parse_args()
-  model_path = Path(args.model)
+  model = None
+  target_class_ids = None
 
-  if not model_path.is_file():
-    raise FileNotFoundError(f'YOLOv8 model not found: {model_path}')
-
-  model = YOLO(str(model_path))
-  target_class_ids = resolve_target_class_ids(model, TARGET_CLASS_NAMES)
+  if args.yolo:
+    model_path = Path(args.model)
+    if not model_path.is_file():
+      raise FileNotFoundError(f'YOLOv8 model not found: {model_path}')
+    model = YOLO(str(model_path))
+    target_class_ids = resolve_target_class_ids(model, TARGET_CLASS_NAMES)
 
   cap = cv2.VideoCapture(args.url)
   if not cap.isOpened():
@@ -158,9 +166,11 @@ def main():
 
   cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
   print(f'Stream: {args.url}')
-  print(f'Model: {model_path}')
-  print(f'Classes: {", ".join(TARGET_CLASS_NAMES)}')
-  print(f'conf={args.confidence}, iou={args.iou}, imgsz={args.imgsz}, max_det={args.max_det}')
+  print(f'YOLO: {"on" if args.yolo else "off"}')
+  if args.yolo:
+    print(f'Model: {args.model}')
+    print(f'Classes: {", ".join(TARGET_CLASS_NAMES)}')
+    print(f'conf={args.confidence}, iou={args.iou}, imgsz={args.imgsz}, max_det={args.max_det}')
   print(f'Screenshots: {args.screenshot_dir}')
 
   screenshot_dir = Path(args.screenshot_dir)
@@ -190,16 +200,20 @@ def main():
           break
         continue
 
-      results = model(
-        frame,
-        conf=args.confidence,
-        iou=args.iou,
-        imgsz=args.imgsz,
-        max_det=args.max_det,
-        classes=target_class_ids,
-        verbose=False,
-      )
-      latest_detected_frame = results[0].plot()
+      if args.yolo:
+        results = model(
+          frame,
+          conf=args.confidence,
+          iou=args.iou,
+          imgsz=args.imgsz,
+          max_det=args.max_det,
+          classes=target_class_ids,
+          verbose=False,
+        )
+        latest_detected_frame = results[0].plot()
+      else:
+        latest_detected_frame = frame
+
       cv2.imshow(WINDOW_NAME, latest_detected_frame)
 
       key = cv2.waitKey(1) & 0xFF
