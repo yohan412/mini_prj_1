@@ -1,0 +1,18 @@
+
+# 스크린샷 및 캡처 이미지 폴더
+screenshots/
+*.jpg
+*.jpeg
+*.png
+
+yh/pinky_pro/screenshots/*
+
+yh/pinky_pro/dataset/
+*.jpg
+*.jpeg
+*.png
+*.txt
+yh/pinky_pro/runs/train/pinky_fruit/args.yaml
+yh/pinky_pro/runs/train/pinky_fruit/results.csv
+yh/pinky_pro/runs/train/pinky_fruit/weights/best.pt
+yh/pinky_pro/runs/train/pinky_fruit/weights/last.pt
