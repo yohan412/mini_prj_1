@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>Pinky YOLO Fruit Navigation</title>
+  <style>
+    :root {
+      --pink-start: #ff6bb8;
+      --blue-end: #7a9be8;
+      --card-bg: #0b1020;
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --text-main: #e5e7eb;
+      --text-muted: #9ca3af;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; height: 100vh; display: flex;
+      font-family: system-ui, sans-serif;
+      background: radial-gradient(circle at top left, #201537, #020617 55%, #000 100%);
+      color: var(--text-main);
+    }
+    #left { flex: 1; display: flex; align-items: center; justify-content: center; padding: 20px; }
+    .map-card {
+      width: 100%; max-width: 900px; border-radius: 24px; padding: 16px;
+      background: var(--card-bg); border: 1px solid var(--border-subtle);
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
+    }
+    canvas { border-radius: 18px; background: #000; border: 1px solid var(--border-subtle); touch-action: none; cursor: crosshair; }
+    #right {
+      width: 360px; padding: 16px; display: flex; flex-direction: column; gap: 12px;
+      border-left: 1px solid rgba(15,23,42,0.9); overflow-y: auto;
+      background: #020617;
+    }
+    .panel-card {
+      background: rgba(15,23,42,0.85); border-radius: 16px; padding: 12px;
+      border: 1px solid var(--border-subtle);
+    }
+    .section-title {
+      font-size: 11px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.08em; color: var(--text-muted); margin-bottom: 8px;
+    }
+    .btn {
+      border: none; border-radius: 10px; padding: 8px 10px; cursor: pointer;
+      font-size: 13px; font-weight: 500; color: #fff;
+    }
+    .btn-fruit { background: linear-gradient(135deg, #f97316, #ea580c); margin: 4px; min-width: 72px; }
+    .btn-primary { background: linear-gradient(135deg, var(--pink-start), var(--blue-end)); width: 100%; margin-top: 6px; }
+    .btn-outline { background: transparent; border: 1px solid var(--border-subtle); color: var(--text-main); width: 100%; margin-top: 6px; }
+    .btn-danger { background: #dc2626; width: 100%; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .fruit-row { display: flex; flex-wrap: wrap; gap: 4px; }
+    .video-feed { width: 100%; border-radius: 12px; border: 1px solid var(--border-subtle); max-width: 320px; }
+    .info-line { font-size: 12px; color: var(--text-muted); display: flex; justify-content: space-between; margin-bottom: 4px; }
+    .info-line .value { color: var(--text-main); font-variant-numeric: tabular-nums; }
+    .nav-status-dot { width: 8px; height: 8px; border-radius: 50%; background: #6b7280; display: inline-block; margin-right: 6px; }
+    .nav-status-dot.active { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+    .queue-item {
+      font-size: 12px; padding: 6px 8px; margin-bottom: 4px; border-radius: 8px;
+      background: rgba(255,255,255,0.04); display: flex; justify-content: space-between; align-items: center;
+    }
+    .queue-item.running { border: 1px solid #22c55e; }
+    .queue-item.failed { border: 1px solid #ef4444; }
+    .status-pill { font-size: 10px; padding: 2px 6px; border-radius: 999px; background: rgba(255,255,255,0.1); }
+    .tiny-note { font-size: 11px; color: var(--text-muted); margin-top: 6px; }
+    .object-colors { font-size: 11px; color: var(--text-muted); }
+    .toggle-row { display: flex; align-items: center; justify-content: space-between; font-size: 12px; margin: 4px 0; }
+    .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+    .legend-lidar { background: #ef4444; }
+    .legend-lidar-dynamic { background: #22d3ee; }
+    .legend-cluster { background: transparent; border: 2px solid #22d3ee; width: 10px; height: 10px; }
+    .legend-cluster-labeled { background: #f97316; border: 2px solid #fff; width: 10px; height: 10px; }
+  </style>
+</head>
+<body>
+<div id="left">
+  <div class="map-card">
+    <div style="width:100%;display:flex;justify-content:space-between;align-items:center;">
+      <span style="font-size:14px;font-weight:600;color:var(--text-muted);">MINI PRJ MAP · Fruit Nav</span>
+      <span class="info-line" style="margin:0;"><span id="updateText">-</span></span>
+    </div>
+    <canvas id="mapCanvas" width="640" height="480"></canvas>
+    <div class="tiny-note">빨강: LiDAR hit · 청록 원: 미확인 · 색 원+라벨: 3초 누적 점수로 확정된 클래스</div>
+  </div>
+</div>
+
+<div id="right">
+  <div class="panel-card">
+    <div class="section-title">LiDAR Layers</div>
+    <label class="toggle-row">
+      <span><span class="legend-dot legend-lidar"></span>Scan points</span>
+      <input type="checkbox" id="toggleLidarScan" checked>
+    </label>
+    <label class="toggle-row">
+      <span><span class="legend-dot legend-lidar-dynamic"></span>Dynamic hits</span>
+      <input type="checkbox" id="toggleLidarDynamic" checked>
+    </label>
+    <label class="toggle-row">
+      <span><span class="legend-dot legend-cluster"></span>Clusters (미인식)</span>
+      <input type="checkbox" id="toggleLidarClusters" checked>
+    </label>
+    <label class="toggle-row">
+      <span><span class="legend-dot legend-cluster-labeled"></span>Clusters (YOLO 인식)</span>
+      <input type="checkbox" id="toggleLidarLabeled" checked>
+    </label>
+    <div class="info-line" style="margin-top:6px;">
+      <span>Points / Clusters</span>
+      <span class="value" id="lidarStatsText">-</span>
+    </div>
+  </div>
+
+  <div class="panel-card">
+    <div class="section-title">Robot</div>
+    <div class="info-line"><span>Pose</span><span class="value" id="poseText">-</span></div>
+    <div class="info-line"><span>Ultrasonic</span><span class="value" id="usText">-</span></div>
+    <div class="info-line">
+      <span><span id="navStatusDot" class="nav-status-dot"></span><span id="navStatusText">Idle</span></span>
+    </div>
+    <button id="btnNavStop" class="btn btn-danger" disabled>Stop Navigation</button>
+  </div>
+
+  <div class="panel-card">
+    <div class="section-title">Camera + YOLO</div>
+    <img class="video-feed" id="videoFeed" src="/api/video_feed" alt="YOLO stream">
+  </div>
+
+  <div class="panel-card">
+    <div class="section-title">Fruit Commands (Queue)</div>
+    <div class="fruit-row">
+      <button class="btn btn-fruit" data-fruit="apple">Apple</button>
+      <button class="btn btn-fruit" data-fruit="banana">Banana</button>
+      <button class="btn btn-fruit" data-fruit="orange">Orange</button>
+      <button class="btn btn-fruit" data-fruit="carrot">Carrot</button>
+    </div>
+    <div class="tiny-note">LiDAR map 좌표 + YOLO 클래스로 목표 설정</div>
+  </div>
+
+  <div class="panel-card">
+    <div class="section-title">Home</div>
+    <div class="info-line"><span>Saved</span><span class="value" id="homeText">-</span></div>
+    <button id="btnSetHome" class="btn btn-outline">현재 위치를 처음 위치로 저장</button>
+    <button id="btnGoHome" class="btn btn-primary">처음 위치로 이동 (큐)</button>
+  </div>
+
+  <div class="panel-card">
+    <div class="section-title">Map Pose</div>
+    <button id="btnModeGoal" class="btn btn-outline" style="margin-top:0;">Set Pose (Queue)</button>
+    <button id="btnModeInit" class="btn btn-outline">Set Initial Pose</button>
+    <div class="tiny-note" id="modeHint">맵 클릭+드래그로 pose를 큐에 추가합니다.</div>
+  </div>
+
+  <div class="panel-card">
+    <div class="section-title">Command Queue</div>
+    <div id="queueList"></div>
+    <button id="btnClearQueue" class="btn btn-outline">Clear Pending</button>
+  </div>
+
+  <div class="panel-card object-colors">
+    <div class="section-title">Detected Objects</div>
+    <div id="objectList">-</div>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById("mapCanvas");
+const ctx = canvas.getContext("2d");
+let latestState = null;
+let clickMode = "goal";
+let isDraggingGoal = false;
+let goalStartWorld = null;
+let goalCurrentCanvas = null;
+
+const FRUIT_COLORS = { apple: "#ef4444", banana: "#facc15", orange: "#f97316", carrot: "#22c55e" };
+const LABEL_TEXT_COLORS = { apple: "#7f1d1d", banana: "#854d0e", orange: "#9a3412", carrot: "#14532d" };
+
+function drawMapLabel(text, cx, cy, className, aboveY = -14) {
+  const accent = FRUIT_COLORS[className] || "#a855f7";
+  const textColor = LABEL_TEXT_COLORS[className] || "#1e1b4b";
+  ctx.font = "bold 11px sans-serif";
+  ctx.textAlign = "center";
+  const metrics = ctx.measureText(text);
+  const padX = 5;
+  const padY = 3;
+  const tw = metrics.width + padX * 2;
+  const th = 12 + padY * 2;
+  const x = cx - tw / 2;
+  const y = cy + aboveY - th;
+  ctx.fillStyle = "rgba(255,255,255,0.94)";
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.roundRect(x, y, tw, th, 4);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = textColor;
+  ctx.fillText(text, cx, y + padY + 10);
+  ctx.textAlign = "left";
+}
+
+function drawClusterLabel(cx, cy, cl) {
+  const color = FRUIT_COLORS[cl.class] || "#a855f7";
+  ctx.fillStyle = color;
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(cx, cy, 10, 0, 2 * Math.PI);
+  ctx.fill();
+  ctx.stroke();
+  const conf = cl.confidence != null ? ` ${(cl.confidence * 100).toFixed(0)}%` : "";
+  drawMapLabel(`${cl.class}${conf}`, cx, cy, cl.class, -14);
+}
+
+function clusterNear(x, y, clusters, tol = 0.25) {
+  return clusters.some(cl =>
+    cl.locked && cl.class &&
+    Math.hypot(cl.map_x - x, cl.map_y - y) < tol
+  );
+}
+
+let showLidarScan = true;
+let showLidarDynamic = true;
+let showLidarClusters = true;
+let showLidarLabeled = true;
+
+document.getElementById("toggleLidarScan").addEventListener("change", (e) => {
+  showLidarScan = e.target.checked;
+  drawState();
+});
+document.getElementById("toggleLidarDynamic").addEventListener("change", (e) => {
+  showLidarDynamic = e.target.checked;
+  drawState();
+});
+document.getElementById("toggleLidarClusters").addEventListener("change", (e) => {
+  showLidarClusters = e.target.checked;
+  drawState();
+});
+document.getElementById("toggleLidarLabeled").addEventListener("change", (e) => {
+  showLidarLabeled = e.target.checked;
+  drawState();
+});
+
+document.querySelectorAll(".btn-fruit").forEach(btn => {
+  btn.addEventListener("click", async () => {
+    const fruit = btn.dataset.fruit;
+    await fetch("/api/queue/add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "fruit", params: { class: fruit } }),
+    });
+  });
+});
+
+document.getElementById("btnSetHome").addEventListener("click", async () => {
+  await fetch("/api/home/set", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+});
+
+document.getElementById("btnGoHome").addEventListener("click", async () => {
+  await fetch("/api/home/go", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+});
+
+document.getElementById("btnNavStop").addEventListener("click", async () => {
+  await fetch("/api/nav/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+});
+
+document.getElementById("btnClearQueue").addEventListener("click", async () => {
+  await fetch("/api/queue/clear", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+});
+
+document.getElementById("btnModeGoal").addEventListener("click", () => setClickMode("goal"));
+document.getElementById("btnModeInit").addEventListener("click", () => setClickMode("initialpose"));
+
+function setClickMode(mode) {
+  clickMode = mode;
+  document.getElementById("modeHint").textContent = mode === "goal"
+    ? "맵 클릭+드래그로 pose를 큐에 추가합니다."
+    : "맵 클릭+드래그로 AMCL 초기 위치를 설정합니다.";
+}
+
+function updateNavStatus(navigating) {
+  document.getElementById("navStatusDot").classList.toggle("active", navigating);
+  document.getElementById("navStatusText").textContent = navigating ? "Navigating" : "Idle";
+  document.getElementById("btnNavStop").disabled = !navigating;
+}
+
+function renderQueue(queue) {
+  const el = document.getElementById("queueList");
+  if (!queue || queue.length === 0) {
+    el.innerHTML = '<div class="tiny-note">큐가 비어 있습니다.</div>';
+    return;
+  }
+  el.innerHTML = queue.map(cmd => {
+    const label = cmd.type === "fruit" ? cmd.params.class : cmd.type;
+    const phase = cmd.params?._phase;
+    const detail = cmd.message || (phase && phase !== "nav2" ? phase : "");
+    return `<div class="queue-item ${cmd.status}">
+      <span>${label}${detail ? ` · ${detail}` : ""}</span>
+      <span class="status-pill">${cmd.status}</span>
+    </div>`;
+  }).join("");
+}
+
+function renderObjects(objects, trackerObjects) {
+  const el = document.getElementById("objectList");
+  const labeled = (objects || []).filter(o => o.locked && o.class);
+  const unlabeled = (trackerObjects || []).filter(o => !o.locked || !o.class);
+  if (labeled.length === 0 && unlabeled.length === 0) {
+    el.textContent = "감지된 객체 없음";
+    return;
+  }
+  let html = "";
+  if (labeled.length > 0) {
+    html += labeled.map(o =>
+      `<div>${o.class} @ (${o.map_x?.toFixed(2)}, ${o.map_y?.toFixed(2)}) conf=${(o.confidence||0).toFixed(2)} [고정]</div>`
+    ).join("");
+  }
+  if (unlabeled.length > 0) {
+    html += `<div style="margin-top:4px;color:#9ca3af;">미확인 LiDAR (${unlabeled.length}):</div>`;
+    html += unlabeled.map(o =>
+      `<div style="color:#9ca3af;">@ (${o.map_x?.toFixed(2)}, ${o.map_y?.toFixed(2)}) d=${(o.distance||0).toFixed(2)}m</div>`
+    ).join("");
+  }
+  el.innerHTML = html;
+}
+
+async function fetchState() {
+  try {
+    const res = await fetch("/api/state");
+    if (!res.ok) return;
+    latestState = await res.json();
+    drawState();
+    document.getElementById("updateText").textContent = new Date().toLocaleTimeString();
+    if (latestState.pose) {
+      const p = latestState.pose;
+      document.getElementById("poseText").textContent =
+        `x=${p.x.toFixed(2)}, y=${p.y.toFixed(2)}`;
+    }
+    if (latestState.ultrasonic_range != null) {
+      document.getElementById("usText").textContent =
+        `${latestState.ultrasonic_range.toFixed(3)} m`;
+    } else {
+      document.getElementById("usText").textContent = "-";
+    }
+    if (latestState.home_pose) {
+      const h = latestState.home_pose;
+      document.getElementById("homeText").textContent = h.set
+        ? `(${h.x.toFixed(2)}, ${h.y.toFixed(2)})` : "미설정";
+    }
+    updateNavStatus(!!latestState.navigating);
+    renderQueue(latestState.queue);
+    renderObjects(latestState.map_objects, latestState.tracker_objects);
+    const pts = latestState.lidar_points || [];
+    const cls = latestState.lidar_clusters || [];
+    const labeledCount = cls.filter(c => c.locked).length;
+    document.getElementById("lidarStatsText").textContent =
+      `${pts.length} pts / ${cls.length} clusters (${labeledCount} labeled)`;
+  } catch (e) { console.error(e); }
+}
+
+function drawState() {
+  if (!latestState || !latestState.map) {
+    ctx.fillStyle = "#111";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+  const map = latestState.map;
+  const pose = latestState.pose;
+  const path = latestState.path || [];
+  const objects = latestState.map_objects || [];
+  const lidarPoints = latestState.lidar_points || [];
+  const lidarClusters = latestState.lidar_clusters || [];
+  const trackerObjects = latestState.tracker_objects || [];
+  const width = map.width, height = map.height, data = map.data;
+  const resolution = map.resolution, origin = map.origin;
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const scale = Math.min(canvas.width / width, canvas.height / height);
+
+  function cellToCanvas(ix, iy) {
+    return [ix * scale, (height - 1 - iy) * scale];
+  }
+  function worldToCanvas(wx, wy) {
+    const mx = (wx - origin.x) / resolution;
+    const my = (wy - origin.y) / resolution;
+    return cellToCanvas(mx, my);
+  }
+
+  for (let iy = 0; iy < height; iy++) {
+    for (let ix = 0; ix < width; ix++) {
+      const v = data[iy * width + ix];
+      ctx.fillStyle = v < 0 ? "#4b5563" : v === 0 ? "#fff" : v >= 100 ? "#000" : "#d1d5db";
+      const [px, py] = cellToCanvas(ix, iy);
+      ctx.fillRect(px, py, scale, scale);
+    }
+  }
+
+  if (path.length > 0) {
+    ctx.strokeStyle = "#22c55e"; ctx.lineWidth = 2; ctx.beginPath();
+    path.forEach((pt, i) => {
+      const [px, py] = worldToCanvas(pt.x, pt.y);
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    });
+    ctx.stroke();
+  }
+
+  // LiDAR scan visualization (simulation-style)
+  if (pose && showLidarScan && lidarPoints.length > 0) {
+    const [rx, ry] = worldToCanvas(pose.x, pose.y);
+    ctx.lineWidth = 1;
+    lidarPoints.forEach(pt => {
+      const [px, py] = worldToCanvas(pt.map_x, pt.map_y);
+      if (pt.dynamic) {
+        if (!showLidarDynamic) return;
+        ctx.strokeStyle = "rgba(34, 211, 238, 0.35)";
+        ctx.fillStyle = "#22d3ee";
+      } else {
+        ctx.strokeStyle = "rgba(239, 68, 68, 0.25)";
+        ctx.fillStyle = "rgba(239, 68, 68, 0.7)";
+      }
+      ctx.beginPath();
+      ctx.moveTo(rx, ry);
+      ctx.lineTo(px, py);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(px, py, pt.dynamic ? 3 : 2, 0, 2 * Math.PI);
+      ctx.fill();
+    });
+  }
+
+  if (showLidarClusters || showLidarLabeled) {
+    lidarClusters.forEach(cl => {
+      const labeled = !!(cl.locked && cl.class);
+      if (labeled && !showLidarLabeled) return;
+      if (!labeled && !showLidarClusters) return;
+      const [cx, cy] = worldToCanvas(cl.map_x, cl.map_y);
+      if (labeled) {
+        drawClusterLabel(cx, cy, cl);
+        return;
+      }
+      ctx.strokeStyle = "#22d3ee";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, 8, 0, 2 * Math.PI);
+      ctx.stroke();
+      ctx.fillStyle = "rgba(34, 211, 238, 0.25)";
+      ctx.fill();
+    });
+  }
+
+  // Unlabeled tracker objects (LiDAR only, gray) — skip if shown as locked cluster
+  trackerObjects.filter(o => !o.locked || !o.class).forEach(obj => {
+    if (clusterNear(obj.map_x, obj.map_y, lidarClusters)) return;
+    const [ox, oy] = worldToCanvas(obj.map_x, obj.map_y);
+    ctx.fillStyle = "#9ca3af";
+    ctx.beginPath(); ctx.arc(ox, oy, 5, 0, 2 * Math.PI); ctx.fill();
+  });
+
+  objects.forEach(obj => {
+    if (obj.map_x == null) return;
+    if (clusterNear(obj.map_x, obj.map_y, lidarClusters)) return;
+    const [ox, oy] = worldToCanvas(obj.map_x, obj.map_y);
+    ctx.fillStyle = FRUIT_COLORS[obj.class] || "#a855f7";
+    ctx.beginPath(); ctx.arc(ox, oy, 7, 0, 2 * Math.PI); ctx.fill();
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    drawMapLabel(obj.class || "?", ox, oy, obj.class, -10);
+  });
+
+  if (pose) {
+    const [rx, ry] = worldToCanvas(pose.x, pose.y);
+    ctx.fillStyle = "#f97316";
+    ctx.beginPath(); ctx.arc(rx, ry, 6, 0, 2 * Math.PI); ctx.fill();
+    const hx = rx + 20 * Math.cos(-pose.yaw);
+    const hy = ry + 20 * Math.sin(-pose.yaw);
+    ctx.strokeStyle = "#fde68a"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(rx, ry); ctx.lineTo(hx, hy); ctx.stroke();
+  }
+
+  if (isDraggingGoal && goalStartWorld && goalCurrentCanvas) {
+    const [sx, sy] = worldToCanvas(goalStartWorld.x, goalStartWorld.y);
+    const color = clickMode === "initialpose" ? "#22c55e" : "#fb7185";
+    ctx.strokeStyle = color; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(sx, sy);
+    ctx.lineTo(goalCurrentCanvas.x, goalCurrentCanvas.y); ctx.stroke();
+  }
+}
+
+function canvasToWorld(cx, cy) {
+  if (!latestState || !latestState.map) return null;
+  const map = latestState.map;
+  const scale = Math.min(canvas.width / map.width, canvas.height / map.height);
+  const ix = cx / scale;
+  const iy = map.height - 1 - cy / scale;
+  return {
+    x: map.origin.x + ix * map.resolution,
+    y: map.origin.y + iy * map.resolution,
+  };
+}
+
+function onPointerDown(e) {
+  const rect = canvas.getBoundingClientRect();
+  const cx = (e.clientX - rect.left) * (canvas.width / rect.width);
+  const cy = (e.clientY - rect.top) * (canvas.height / rect.height);
+  const w = canvasToWorld(cx, cy);
+  if (!w) return;
+  isDraggingGoal = true;
+  goalStartWorld = w;
+  goalCurrentCanvas = { x: cx, y: cy };
+}
+
+function onPointerMove(e) {
+  if (!isDraggingGoal) return;
+  const rect = canvas.getBoundingClientRect();
+  goalCurrentCanvas = {
+    x: (e.clientX - rect.left) * (canvas.width / rect.width),
+    y: (e.clientY - rect.top) * (canvas.height / rect.height),
+  };
+  drawState();
+}
+
+async function onPointerUp(e) {
+  if (!isDraggingGoal || !goalStartWorld) return;
+  const rect = canvas.getBoundingClientRect();
+  const cx = (e.clientX - rect.left) * (canvas.width / rect.width);
+  const cy = (e.clientY - rect.top) * (canvas.height / rect.height);
+  const endWorld = canvasToWorld(cx, cy);
+  isDraggingGoal = false;
+  if (!endWorld) return;
+  const dx = endWorld.x - goalStartWorld.x;
+  const dy = endWorld.y - goalStartWorld.y;
+  const yaw = Math.atan2(dy, dx);
+  const body = { x: goalStartWorld.x, y: goalStartWorld.y, yaw };
+
+  if (clickMode === "initialpose") {
+    await fetch("/api/initialpose", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } else {
+    await fetch("/api/goal", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+  goalStartWorld = null;
+  goalCurrentCanvas = null;
+}
+
+canvas.addEventListener("pointerdown", onPointerDown);
+canvas.addEventListener("pointermove", onPointerMove);
+canvas.addEventListener("pointerup", onPointerUp);
+canvas.addEventListener("pointerleave", () => { isDraggingGoal = false; });
+
+setInterval(fetchState, 500);
+fetchState();
+</script>
+</body>
+</html>

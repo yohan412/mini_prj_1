@@ -1,3 +1,4 @@
+*.pyc
 
 # 스크린샷 및 캡처 이미지 폴더
 screenshots/
