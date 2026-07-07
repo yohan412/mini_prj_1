@@ -15,7 +15,7 @@ from pathlib import Path
 from ultralytics import YOLO
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_PATH = SCRIPT_DIR / 'yolo11n.pt'
+DEFAULT_MODEL_PATH = SCRIPT_DIR / 'best.pt'
 DEFAULT_STREAM_URL = 'http://192.168.4.1:5000/video'
 DEFAULT_SCREENSHOT_DIR = SCRIPT_DIR / 'screenshots'
 AUTO_SCREENSHOT_INTERVAL_SEC = 5.0
