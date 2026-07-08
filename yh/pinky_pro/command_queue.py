@@ -102,6 +102,9 @@ class CommandQueue:
     self._last_motion_time: float = time.monotonic()
 
     self.resolve_fruit_goal: Optional[Callable[[str], Optional[GoalTuple]]] = None
+    self.resolve_fruit_target_xy: Optional[
+      Callable[[str], Optional[tuple[float, float]]]
+    ] = None
     self.resolve_home_goal: Optional[Callable[[], Optional[GoalTuple]]] = None
     self.send_goal: Optional[Callable[[float, float, float], bool]] = None
     self.cancel_navigation: Optional[Callable[[], bool]] = None
@@ -315,7 +318,7 @@ class CommandQueue:
           self.stop_robot()
         command.params['_phase'] = 'align'
         command.params['_phase_started'] = time.time()
-        command.message = f'Aligning to {fruit_class}'
+        command.message = f'LiDAR aligning to {fruit_class}'
         return
       self._finish(command, CommandStatus.COMPLETED, f'Arrived at {fruit_class}')
 
@@ -331,8 +334,13 @@ class CommandQueue:
       approach_timeout=self.approach_timeout,
     )
 
+  def _fruit_target_xy(self, fruit_class: str) -> Optional[tuple[float, float]]:
+    if self.resolve_fruit_target_xy is not None:
+      return self.resolve_fruit_target_xy(fruit_class)
+    return None
+
   def _tick_fruit_align(self, command: NavCommand, fruit_class: str) -> None:
-    from fruit_final_approach import compute_align_cmd, is_aligned
+    from fruit_final_approach import compute_lidar_align_cmd, is_heading_aligned
 
     started = float(command.params.get('_phase_started', time.time()))
     if (time.time() - started) > self.align_timeout:
@@ -341,21 +349,20 @@ class CommandQueue:
       self._finish(command, CommandStatus.FAILED, f'Align timeout for {fruit_class}')
       return
 
-    if self.get_fruit_detection is None or self.publish_cmd_vel is None:
+    if self.publish_cmd_vel is None or self.get_robot_pose is None:
       self._finish(command, CommandStatus.FAILED, 'Fine approach not available')
       return
 
-    detection = self.get_fruit_detection(fruit_class)
+    pose = self.get_robot_pose()
+    target_xy = self._fruit_target_xy(fruit_class)
     config = self._final_approach_config()
-    if detection is None:
-      command.message = f'Waiting for {fruit_class} in camera'
+    if pose is None or target_xy is None:
+      command.message = f'Waiting for LiDAR target ({fruit_class})'
       if self.stop_robot:
         self.stop_robot()
       return
 
-    cx = detection['cx']
-    frame_width = detection['frame_width']
-    if is_aligned(cx, frame_width, config):
+    if is_heading_aligned(pose, target_xy, config):
       if self.stop_robot:
         self.stop_robot()
       command.params['_phase'] = 'approach'
@@ -363,12 +370,16 @@ class CommandQueue:
       command.message = f'Approaching {fruit_class}'
       return
 
-    linear, angular = compute_align_cmd(cx, frame_width, config)
+    linear, angular = compute_lidar_align_cmd(pose, target_xy, config)
     self.publish_cmd_vel(linear, angular)
-    command.message = f'Aligning to {fruit_class}'
+    command.message = f'LiDAR aligning to {fruit_class}'
 
   def _tick_fruit_approach(self, command: NavCommand, fruit_class: str) -> None:
-    from fruit_final_approach import compute_approach_cmd, is_valid_ultrasonic
+    from fruit_final_approach import (
+      compute_ultrasonic_approach_cmd,
+      compute_lidar_align_cmd,
+      is_valid_ultrasonic,
+    )
 
     started = float(command.params.get('_phase_started', time.time()))
     if (time.time() - started) > self.approach_timeout:
@@ -383,18 +394,25 @@ class CommandQueue:
 
     config = self._final_approach_config()
     range_m = self.get_ultrasonic_range()
-    detection = self.get_fruit_detection(fruit_class) if self.get_fruit_detection else None
-    cx = detection['cx'] if detection else None
-    frame_width = detection['frame_width'] if detection else None
+    pose = self.get_robot_pose() if self.get_robot_pose else None
+    target_xy = self._fruit_target_xy(fruit_class)
 
     if not is_valid_ultrasonic(range_m, config):
-      command.message = f'Waiting for ultrasonic ({fruit_class})'
-      if self.stop_robot:
-        self.stop_robot()
+      # Keep facing the target even before ultrasonic becomes valid.
+      if pose is not None and target_xy is not None:
+        linear, angular = compute_lidar_align_cmd(pose, target_xy, config)
+        self.publish_cmd_vel(linear, angular)
+        command.message = f'Waiting for ultrasonic, LiDAR aligning ({fruit_class})'
+      else:
+        command.message = f'Waiting for ultrasonic ({fruit_class})'
+        if self.stop_robot:
+          self.stop_robot()
       return
 
     assert range_m is not None
-    linear, angular = compute_approach_cmd(range_m, cx, frame_width, config)
+    linear, angular = compute_ultrasonic_approach_cmd(
+      range_m, pose, target_xy, config,
+    )
     if linear == 0.0 and angular == 0.0:
       if self.stop_robot:
         self.stop_robot()

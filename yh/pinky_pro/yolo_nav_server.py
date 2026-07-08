@@ -13,6 +13,9 @@ import math
 import threading
 import time
 from pathlib import Path
+from typing import Any, Optional
+import urllib.error
+import urllib.request
 
 import cv2
 import rclpy
@@ -36,19 +39,39 @@ from sensor_msgs.msg import LaserScan, Range
 from tf2_ros import Buffer, TransformListener
 from ultralytics import YOLO
 
+from classify_zones import ClassifyZone, parse_classify_zones
 from cluster_class_voter import ClusterClassVoter
 from command_queue import CommandQueue
 from lidar_object_tracker import LidarObjectTracker
-from yolo_nav_fusion import fuse_detections, parse_yolo_results, resolve_fruit_goal
+from yolo_nav_fusion import (
+  fuse_detections,
+  parse_yolo_results,
+  resolve_fruit_goal,
+  resolve_fruit_target_xy,
+)
+from recipe_orchestrator import ExchangePose, Recipe, RecipeOrchestrator
+from robot_session import RobotSession, RobotSessionConfig
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_PATH = SCRIPT_DIR / 'best.pt'
 DEFAULT_STREAM_URL = 'http://192.168.4.1:5000/video'
 HOME_POSE_PATH = Path.home() / '.pinky_pro' / 'home_pose.json'
-TARGET_CLASS_NAMES = ('apple', 'banana', 'orange', 'carrot')
+EXCHANGE_POSES_PATH = Path.home() / '.pinky_pro' / 'exchange_poses.json'
+TARGET_CLASS_NAMES = (
+  'apple',
+  'banana',
+  'orange',
+  'carrot',
+  'apple_pie',
+  'carrot_soup',
+  'banana_pudding',
+  'jelly',
+  'bell',
+)
 
 app = Flask(__name__, static_folder=str(SCRIPT_DIR), static_url_path='')
 ros_node = None
+kitchen_manager: Optional["KitchenManager"] = None
 
 
 def quat_to_yaw(q) -> float:
@@ -76,6 +99,290 @@ def read_latest_frame(cap: cv2.VideoCapture):
     if not cap.grab():
       return False, None
   return cap.retrieve()
+
+
+def _http_json(method: str, url: str, payload: Optional[dict[str, Any]] = None) -> Any:
+  data = None
+  headers = {}
+  if payload is not None:
+    data = json.dumps(payload).encode("utf-8")
+    headers["Content-Type"] = "application/json"
+  req = urllib.request.Request(url, data=data, headers=headers, method=method)
+  with urllib.request.urlopen(req, timeout=2.0) as res:
+    body = res.read().decode("utf-8")
+    return json.loads(body) if body else None
+
+
+class BridgeClient:
+  def __init__(self, robot_id: str, role: str, bridge_url: str):
+    self.robot_id = robot_id
+    self.role = role
+    self.bridge_url = bridge_url.rstrip("/")
+
+  def get_state(self) -> dict[str, Any] | None:
+    try:
+      data = _http_json("GET", f"{self.bridge_url}/api/state")
+      return data if isinstance(data, dict) else None
+    except (urllib.error.URLError, TimeoutError, ValueError):
+      return None
+
+  def get_queue(self) -> list[dict[str, Any]]:
+    state = self.get_state() or {}
+    q = state.get("queue") or []
+    return q if isinstance(q, list) else []
+
+  def queue_fruit(self, cls: str) -> bool:
+    try:
+      res = _http_json(
+        "POST",
+        f"{self.bridge_url}/api/queue/add",
+        {"type": "fruit", "params": {"class": cls}},
+      )
+      return bool(res and res.get("success"))
+    except (urllib.error.URLError, TimeoutError, ValueError):
+      return False
+
+  def queue_pose(self, x: float, y: float, yaw: float, label: str = "") -> bool:
+    payload = {"type": "pose", "params": {"x": x, "y": y, "yaw": yaw}}
+    if label:
+      payload["params"]["label"] = label
+    try:
+      res = _http_json("POST", f"{self.bridge_url}/api/queue/add", payload)
+      return bool(res and res.get("success"))
+    except (urllib.error.URLError, TimeoutError, ValueError):
+      return False
+
+  def stop_all(self) -> bool:
+    try:
+      res = _http_json("POST", f"{self.bridge_url}/api/queue/stop_all", {})
+      return bool(res and res.get("success"))
+    except (urllib.error.URLError, TimeoutError, ValueError):
+      return False
+
+  def clear_labels(self) -> int | None:
+    try:
+      res = _http_json("POST", f"{self.bridge_url}/api/labels/clear", {})
+      if not res or not res.get("success"):
+        return None
+      return int(res.get("cleared") or 0)
+    except (urllib.error.URLError, TimeoutError, ValueError):
+      return None
+
+
+class KitchenManager:
+  def __init__(self, cfg: dict[str, Any], model_path: Path):
+    try:
+      import yaml  # type: ignore
+    except Exception as exc:
+      raise RuntimeError("PyYAML is required for --config mode") from exc
+
+    self.raw_cfg = cfg
+    self.model = YOLO(str(model_path))
+
+    robots = cfg.get("robots") or {}
+    self.sessions: dict[str, RobotSession] = {}
+    self.clients: dict[str, BridgeClient] = {}
+    self.exchange: dict[str, ExchangePose] = {}
+
+    for robot_id, rcfg in robots.items():
+      role = str(rcfg.get("role") or "")
+      bridge_url = str(rcfg.get("bridge_url") or "")
+      stream_url = str(rcfg.get("stream_url") or "")
+      ex = rcfg.get("exchange_pose") or {}
+      self.exchange[robot_id] = ExchangePose(
+        x=float(ex.get("x") or 0.0),
+        y=float(ex.get("y") or 0.0),
+        yaw=float(ex.get("yaw") or 0.0),
+      )
+
+      self.clients[robot_id] = BridgeClient(robot_id=robot_id, role=role, bridge_url=bridge_url)
+      params = rcfg.get("params") or {}
+      zones_raw = rcfg.get("classify_zones")
+      if zones_raw is None:
+        zones_raw = params.get("classify_zones")
+      s_cfg = RobotSessionConfig(
+        robot_id=robot_id,
+        bridge_url=bridge_url,
+        stream_url=stream_url,
+        label_confidence=float(params.get("label_confidence") or 0.8),
+        classify_zones=parse_classify_zones(zones_raw),
+      )
+      session = RobotSession(s_cfg, self.model)
+      session.start()
+      self.sessions[robot_id] = session
+
+    supplier_id = next((rid for rid, c in self.clients.items() if c.role == "supplier"), None)
+    server_id = next((rid for rid, c in self.clients.items() if c.role == "server"), None)
+    if not supplier_id or not server_id:
+      raise RuntimeError("config must define one supplier and one server robot")
+
+    orch_cfg = cfg.get("orchestrator") or {}
+    self.orchestrator = RecipeOrchestrator(
+      supplier=self.clients[supplier_id],
+      server=self.clients[server_id],
+      exchange_pose_supplier=self.exchange[supplier_id],
+      exchange_pose_server=self.exchange[server_id],
+      poll_interval_sec=float(orch_cfg.get("poll_interval_sec") or 0.25),
+      detection_timeout=float(orch_cfg.get("detection_timeout") or 30.0),
+      handoff_timeout=float(orch_cfg.get("handoff_timeout") or 120.0),
+    )
+
+    self.recipes: dict[str, Recipe] = {}
+    for name, r in (cfg.get("recipes") or {}).items():
+      self.recipes[str(name)] = Recipe(
+        name=str(name),
+        ingredient=str(r.get("ingredient")),
+        dish=str(r.get("dish")),
+      )
+
+    self._order_thread: Optional[threading.Thread] = None
+    self._last_order_status: dict[str, Any] = self.orchestrator.get_status()
+    self._exchange_saved: dict[str, bool] = {rid: False for rid in self.exchange}
+    self._load_saved_exchange_poses()
+    self._sync_orchestrator_exchange()
+
+  @staticmethod
+  def _load_exchange_poses_file() -> dict[str, Any]:
+    if not EXCHANGE_POSES_PATH.is_file():
+      return {}
+    try:
+      data = json.loads(EXCHANGE_POSES_PATH.read_text(encoding='utf-8'))
+      return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+      return {}
+
+  def _persist_exchange_poses(self) -> None:
+    payload: dict[str, Any] = {}
+    for robot_id, ex in self.exchange.items():
+      payload[robot_id] = {
+        'x': ex.x,
+        'y': ex.y,
+        'yaw': ex.yaw,
+        'set': bool(self._exchange_saved.get(robot_id)),
+      }
+    EXCHANGE_POSES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    EXCHANGE_POSES_PATH.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+
+  def _load_saved_exchange_poses(self) -> None:
+    saved = self._load_exchange_poses_file()
+    for robot_id, data in saved.items():
+      if robot_id not in self.exchange or not isinstance(data, dict):
+        continue
+      if not data.get('set'):
+        continue
+      try:
+        self.exchange[robot_id] = ExchangePose(
+          x=float(data['x']),
+          y=float(data['y']),
+          yaw=float(data.get('yaw') or 0.0),
+        )
+        self._exchange_saved[robot_id] = True
+      except (KeyError, TypeError, ValueError):
+        continue
+
+  def _sync_orchestrator_exchange(self) -> None:
+    supplier_id = next((rid for rid, c in self.clients.items() if c.role == 'supplier'), None)
+    server_id = next((rid for rid, c in self.clients.items() if c.role == 'server'), None)
+    if supplier_id:
+      self.orchestrator.exchange_pose_supplier = self.exchange[supplier_id]
+    if server_id:
+      self.orchestrator.exchange_pose_server = self.exchange[server_id]
+
+  def get_exchange_pose(self, robot_id: str) -> dict[str, Any]:
+    ex = self.exchange.get(robot_id)
+    if ex is None:
+      return {'x': 0.0, 'y': 0.0, 'yaw': 0.0, 'set': False}
+    return {
+      'x': ex.x,
+      'y': ex.y,
+      'yaw': ex.yaw,
+      'set': bool(self._exchange_saved.get(robot_id)),
+    }
+
+  def enrich_robot_state(self, robot_id: str, state: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(state)
+    merged['exchange_pose'] = self.get_exchange_pose(robot_id)
+    return merged
+
+  def save_exchange_pose(self, robot_id: str) -> dict[str, Any]:
+    client = self.clients.get(robot_id)
+    if client is None:
+      return {'success': False, 'error': 'unknown robot'}
+    bridge_state = client.get_state()
+    if not bridge_state or not bridge_state.get('pose'):
+      return {'success': False, 'error': 'pose unavailable'}
+    pose = bridge_state['pose']
+    try:
+      x = float(pose['x'])
+      y = float(pose['y'])
+      yaw = float(pose.get('yaw') or 0.0)
+    except (KeyError, TypeError, ValueError):
+      return {'success': False, 'error': 'invalid pose'}
+    self.exchange[robot_id] = ExchangePose(x=x, y=y, yaw=yaw)
+    self._exchange_saved[robot_id] = True
+    self._persist_exchange_poses()
+    self._sync_orchestrator_exchange()
+    return {'success': True, 'exchange_pose': self.get_exchange_pose(robot_id)}
+
+  def go_exchange_pose(self, robot_id: str) -> dict[str, Any]:
+    client = self.clients.get(robot_id)
+    if client is None:
+      return {'success': False, 'error': 'unknown robot'}
+    ex = self.get_exchange_pose(robot_id)
+    if not ex.get('set'):
+      return {'success': False, 'error': 'exchange pose not set'}
+    ok = client.queue_pose(ex['x'], ex['y'], ex['yaw'], label='exchange')
+    return {'success': ok}
+
+  def list_robots(self) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for rid, client in self.clients.items():
+      out.append({"id": rid, "role": client.role, "bridge_url": client.bridge_url})
+    return out
+
+  def get_robot_state(self, robot_id: str) -> dict[str, Any] | None:
+    session = self.sessions.get(robot_id)
+    if session is None:
+      return None
+    return session.get_latest_state()
+
+  def get_robot_frame(self, robot_id: str) -> bytes | None:
+    session = self.sessions.get(robot_id)
+    return session.get_latest_frame_jpeg() if session else None
+
+  def start_order(self, recipe_name: str) -> dict[str, Any]:
+    recipe = self.recipes.get(recipe_name)
+    if recipe is None:
+      return {"success": False, "error": "unknown recipe"}
+    if self._order_thread is not None and self._order_thread.is_alive():
+      return {"success": False, "error": "order already running"}
+
+    def run():
+      self._last_order_status = self.orchestrator.run_order(recipe)
+
+    self._order_thread = threading.Thread(target=run, daemon=True)
+    self._order_thread.start()
+    self._last_order_status = self.orchestrator.get_status()
+    return {"success": True, "status": self._last_order_status}
+
+  def get_order_status(self) -> dict[str, Any]:
+    if self._order_thread is not None and self._order_thread.is_alive():
+      return {"running": True, **self.orchestrator.get_status()}
+    return {"running": False, **self._last_order_status}
+
+  def cancel_order(self) -> dict[str, Any]:
+    self.orchestrator.cancel()
+    self._last_order_status = self.orchestrator.get_status()
+    return {"success": True, "status": self._last_order_status}
+
+  def clear_robot_labels(self, robot_id: str) -> dict[str, Any]:
+    client = self.clients.get(robot_id)
+    if client is None:
+      return {"success": False, "error": "unknown robot"}
+    cleared = client.clear_labels()
+    if cleared is None:
+      return {"success": False, "error": "bridge unreachable"}
+    return {"success": True, "cleared": cleared}
 
 
 class YoloNavBridge(Node):
@@ -110,6 +417,9 @@ class YoloNavBridge(Node):
       min_vote_score=args.classify_min_score,
       min_vote_confidence=args.label_confidence,
       dominance_ratio=args.classify_dominance_ratio,
+    )
+    self.classify_zones: list[ClassifyZone] = parse_classify_zones(
+      getattr(args, 'classify_zones', None)
     )
     self.command_queue = CommandQueue(
       arrival_threshold=args.arrival_threshold,
@@ -180,6 +490,7 @@ class YoloNavBridge(Node):
 
   def _wire_queue_callbacks(self) -> None:
     self.command_queue.resolve_fruit_goal = self._queue_resolve_fruit
+    self.command_queue.resolve_fruit_target_xy = self._queue_resolve_fruit_target_xy
     self.command_queue.resolve_home_goal = self._queue_resolve_home
     self.command_queue.send_goal = self.send_goal
     self.command_queue.cancel_navigation = self.cancel_goal
@@ -305,6 +616,22 @@ class YoloNavBridge(Node):
       class_voter=self.class_voter,
     )
 
+  def _queue_resolve_fruit_target_xy(self, fruit_class: str):
+    return resolve_fruit_target_xy(
+      self.tracker,
+      fruit_class.lower(),
+      self.get_robot_pose(),
+      class_voter=self.class_voter,
+    )
+
+  def clear_labels(self) -> dict[str, int]:
+    tracker_cleared = self.tracker.clear_all_classes()
+    voter_cleared = self.class_voter.clear_all()
+    return {
+      'tracker_cleared': tracker_cleared,
+      'voter_cleared': voter_cleared,
+    }
+
   def _queue_resolve_home(self):
     if not self.home_pose or not self.home_pose.get('set'):
       return None
@@ -362,6 +689,7 @@ class YoloNavBridge(Node):
       match_angle_deg=self.args.object_match_angle,
       label_confidence=self.args.label_confidence,
       class_voter=self.class_voter,
+      classify_zones=self.classify_zones,
     )
 
     plotted = results[0].plot()
@@ -483,6 +811,9 @@ class YoloNavBridge(Node):
         cl['vote_score'] = label.score
         cl['vote_scores'] = label.scores
         cl['status'] = 'classified'
+        pending = self.class_voter.get_pending_scores(label.object_id)
+        if pending:
+          cl['pending_scores'] = pending
         continue
 
       nearby = self.tracker.find_object_near(
@@ -577,6 +908,123 @@ def mjpeg_generator():
 def serve_index():
   return send_from_directory(str(SCRIPT_DIR), 'yolo_nav.html')
 
+@app.get("/api/robots")
+def api_robots():
+  if kitchen_manager is None:
+    return jsonify({"success": False, "error": "kitchen mode not enabled"}), 400
+  return jsonify({"success": True, "robots": kitchen_manager.list_robots()})
+
+
+@app.get("/api/robots/<robot_id>/state")
+def api_robot_state(robot_id: str):
+  if kitchen_manager is None:
+    return jsonify({"success": False, "error": "kitchen mode not enabled"}), 400
+  st = kitchen_manager.get_robot_state(robot_id)
+  if st is None:
+    return jsonify({"success": False, "error": "unknown robot"}), 404
+  return jsonify({
+    "success": True,
+    "state": kitchen_manager.enrich_robot_state(robot_id, st),
+  })
+
+
+def _robot_mjpeg_generator(robot_id: str):
+  boundary = b"--frame"
+  while True:
+    frame = kitchen_manager.get_robot_frame(robot_id) if kitchen_manager else None
+    if frame is None:
+      time.sleep(0.05)
+      continue
+    yield boundary + b"\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+    time.sleep(1.0 / 15.0)
+
+
+@app.get("/api/robots/<robot_id>/video_feed")
+def api_robot_video_feed(robot_id: str):
+  if kitchen_manager is None:
+    return jsonify({"success": False, "error": "kitchen mode not enabled"}), 400
+  return Response(_robot_mjpeg_generator(robot_id), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.post("/api/robots/<robot_id>/queue/add")
+def api_robot_queue_add(robot_id: str):
+  if kitchen_manager is None:
+    return jsonify({"success": False, "error": "kitchen mode not enabled"}), 400
+  client = kitchen_manager.clients.get(robot_id)
+  if client is None:
+    return jsonify({"success": False, "error": "unknown robot"}), 404
+  data = request.get_json() or {}
+  cmd_type = str(data.get("type") or "")
+  params = data.get("params") or {}
+  if cmd_type == "fruit":
+    ok = client.queue_fruit(str(params.get("class") or ""))
+  elif cmd_type == "pose":
+    ok = client.queue_pose(float(params.get("x")), float(params.get("y")), float(params.get("yaw", 0.0)), label=str(params.get("label") or ""))
+  else:
+    ok = False
+  return jsonify({"success": ok})
+
+
+@app.post("/api/robots/<robot_id>/nav/stop")
+def api_robot_nav_stop(robot_id: str):
+  if kitchen_manager is None:
+    return jsonify({"success": False, "error": "kitchen mode not enabled"}), 400
+  client = kitchen_manager.clients.get(robot_id)
+  if client is None:
+    return jsonify({"success": False, "error": "unknown robot"}), 404
+  ok = client.stop_all()
+  return jsonify({"success": ok})
+
+
+@app.post("/api/robots/<robot_id>/labels/clear")
+def api_robot_labels_clear(robot_id: str):
+  if kitchen_manager is None:
+    return jsonify({"success": False, "error": "kitchen mode not enabled"}), 400
+  result = kitchen_manager.clear_robot_labels(robot_id)
+  status = 200 if result.get("success") else 400
+  return jsonify(result), status
+
+
+@app.post("/api/robots/<robot_id>/exchange/set")
+def api_robot_exchange_set(robot_id: str):
+  if kitchen_manager is None:
+    return jsonify({"success": False, "error": "kitchen mode not enabled"}), 400
+  result = kitchen_manager.save_exchange_pose(robot_id)
+  status = 200 if result.get("success") else 400
+  return jsonify(result), status
+
+
+@app.post("/api/robots/<robot_id>/exchange/go")
+def api_robot_exchange_go(robot_id: str):
+  if kitchen_manager is None:
+    return jsonify({"success": False, "error": "kitchen mode not enabled"}), 400
+  result = kitchen_manager.go_exchange_pose(robot_id)
+  status = 200 if result.get("success") else 400
+  return jsonify(result), status
+
+
+@app.post("/api/order")
+def api_order():
+  if kitchen_manager is None:
+    return jsonify({"success": False, "error": "kitchen mode not enabled"}), 400
+  data = request.get_json() or {}
+  name = str(data.get("recipe") or "")
+  return jsonify(kitchen_manager.start_order(name))
+
+
+@app.get("/api/order/status")
+def api_order_status():
+  if kitchen_manager is None:
+    return jsonify({"success": False, "error": "kitchen mode not enabled"}), 400
+  return jsonify(kitchen_manager.get_order_status())
+
+
+@app.post("/api/order/cancel")
+def api_order_cancel():
+  if kitchen_manager is None:
+    return jsonify({"success": False, "error": "kitchen mode not enabled"}), 400
+  return jsonify(kitchen_manager.cancel_order())
+
 
 @app.route('/api/state')
 def api_state():
@@ -616,6 +1064,14 @@ def api_queue_clear():
     return jsonify({'success': False}), 500
   count = ros_node.command_queue.clear_pending()
   return jsonify({'success': True, 'removed': count})
+
+
+@app.route('/api/labels/clear', methods=['POST'])
+def api_labels_clear():
+  if ros_node is None:
+    return jsonify({'success': False}), 500
+  result = ros_node.clear_labels()
+  return jsonify({'success': True, **result})
 
 
 @app.route('/api/home/set', methods=['POST'])
@@ -684,6 +1140,7 @@ def ros_spin_thread():
 
 def parse_args():
   parser = argparse.ArgumentParser(description='Pinky YOLO navigation server')
+  parser.add_argument('--config', default='', help='Kitchen multi-robot config YAML (enables kitchen mode)')
   parser.add_argument('--stream-url', default=DEFAULT_STREAM_URL)
   parser.add_argument('--model', default=str(DEFAULT_MODEL_PATH))
   parser.add_argument('--port', type=int, default=8090)
@@ -693,8 +1150,8 @@ def parse_args():
   parser.add_argument('--imgsz', type=int, default=320)
   parser.add_argument('--max-det', type=int, default=300)
   parser.add_argument('--hfov-deg', type=float, default=66.0)
-  parser.add_argument('--approach-distance', type=float, default=0.3)
-  parser.add_argument('--arrival-threshold', type=float, default=0.15)
+  parser.add_argument('--approach-distance', type=float, default=0.07)
+  parser.add_argument('--arrival-threshold', type=float, default=0.25)
   parser.add_argument('--detection-timeout', type=float, default=30.0)
   parser.add_argument('--goal-update-interval', type=float, default=2.0)
   parser.add_argument('--cluster-angle-tol', type=float, default=3.0)
@@ -725,14 +1182,50 @@ def parse_args():
                       help='Pose movement below this distance (m) counts as stopped')
   parser.add_argument('--stalled-yaw-tolerance', type=float, default=0.05,
                       help='Yaw change below this (rad) counts as stopped')
-  return parser.parse_args()
+  parser.add_argument(
+    '--classify-zones-file',
+    default='',
+    help='YAML/JSON file with classify_zones rectangles (empty list/absent = allow all)',
+  )
+  args = parser.parse_args()
+  args.classify_zones = []
+  if args.classify_zones_file:
+    zone_path = Path(args.classify_zones_file)
+    if not zone_path.is_file():
+      raise FileNotFoundError(f'Classify zones file not found: {zone_path}')
+    text = zone_path.read_text(encoding='utf-8')
+    raw = None
+    if zone_path.suffix.lower() in {'.yaml', '.yml'}:
+      import yaml  # type: ignore
+      loaded = yaml.safe_load(text) or {}
+      raw = loaded.get('classify_zones', loaded) if isinstance(loaded, dict) else loaded
+    else:
+      loaded = json.loads(text)
+      raw = loaded.get('classify_zones', loaded) if isinstance(loaded, dict) else loaded
+    args.classify_zones = parse_classify_zones(raw)
+  return args
 
 
 def main():
-  global ros_node
+  global ros_node, kitchen_manager
   args = parse_args()
   if not Path(args.model).is_file():
     raise FileNotFoundError(f'Model not found: {args.model}')
+
+  if args.config:
+    try:
+      import yaml  # type: ignore
+    except Exception as exc:
+      raise RuntimeError("PyYAML is required for --config mode") from exc
+    cfg_path = Path(args.config)
+    if not cfg_path.is_file():
+      raise FileNotFoundError(f"Config not found: {cfg_path}")
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    kitchen_manager = KitchenManager(cfg, Path(args.model))
+    time.sleep(1.0)
+    print(f'Kitchen server: http://{args.host}:{args.port}')
+    app.run(host=args.host, port=args.port, debug=False, threaded=True)
+    return
 
   rclpy.init()
   ros_node = YoloNavBridge(args)

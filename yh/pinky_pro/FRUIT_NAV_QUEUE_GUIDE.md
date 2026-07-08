@@ -2,6 +2,8 @@
 
 사전 매핑 맵(`mini_prj_map`) 위에서 LiDAR로 동적 장애물(과일) 좌표를 추정하고, YOLO로 클래스를 라벨링한 뒤, PC 웹 UI에서 명령 큐로 Nav2 주행을 제어하는 기능입니다.
 
+멀티로봇 주방 오케스트레이션(2대 로봇, 별도 맵, 요리 주문 워크플로)은 별도 문서인 `KITCHEN_MULTI_ROBOT_GUIDE.md`를 참고하세요.
+
 관련 계획: `.cursor/plans/과일_내비_큐_ui_14c7cd2c.plan.md`
 
 ---

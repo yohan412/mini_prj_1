@@ -7,6 +7,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from classify_zones import ClassifyZone, allows_classification
 from cluster_class_voter import ClusterClassVoter
 from lidar_object_tracker import LidarCluster, LidarObjectTracker, MapObject
 
@@ -189,6 +190,7 @@ def fuse_detections(
   cam_yaw_offset: float = 0.0,
   label_confidence: float = 0.8,
   class_voter: Optional[ClusterClassVoter] = None,
+  classify_zones: Optional[list[ClassifyZone]] = None,
 ) -> list[dict[str, Any]]:
   hfov_rad = math.radians(hfov_deg)
   match_angle_rad = math.radians(match_angle_deg)
@@ -196,6 +198,7 @@ def fuse_detections(
   fused: list[dict[str, Any]] = []
   used_cluster_keys: set[tuple[float, float]] = set()
   detections = dedupe_same_class_detections(detections)
+  zones = classify_zones or []
 
   # Per cluster+class keep only the highest-confidence detection for voting.
   vote_winners: dict[tuple[str, tuple[float, float]], tuple[YoloDetection, LidarCluster, str]] = {}
@@ -235,11 +238,13 @@ def fuse_detections(
     entry['map_x'] = cluster.map_x
     entry['map_y'] = cluster.map_y
     entry['distance'] = cluster.distance
+    in_zone = allows_classification(cluster.map_x, cluster.map_y, zones)
+    entry['classify_allowed'] = in_zone
 
     if class_voter is not None:
       _apply_display_label(entry, tracker, class_voter, cluster.map_x, cluster.map_y)
 
-      if det.confidence >= label_confidence:
+      if in_zone and det.confidence >= label_confidence:
         target = tracker.find_canonical_vote_target(cluster.map_x, cluster.map_y, det.class_name)
         if target is None:
           target = tracker.find_object_near(cluster.map_x, cluster.map_y)
@@ -276,6 +281,32 @@ def compute_approach_goal(
   return goal_x, goal_y, angle
 
 
+def resolve_fruit_object(
+  tracker: LidarObjectTracker,
+  fruit_class: str,
+  robot_pose: Optional[tuple[float, float, float]],
+  class_voter: Optional[ClusterClassVoter] = None,
+) -> Optional[MapObject]:
+  obj: Optional[MapObject] = None
+  if class_voter is not None:
+    obj = class_voter.find_object_by_class(tracker, fruit_class, robot_pose)
+  if obj is None:
+    obj = tracker.find_by_class(fruit_class, robot_pose)
+  return obj
+
+
+def resolve_fruit_target_xy(
+  tracker: LidarObjectTracker,
+  fruit_class: str,
+  robot_pose: Optional[tuple[float, float, float]],
+  class_voter: Optional[ClusterClassVoter] = None,
+) -> Optional[tuple[float, float]]:
+  obj = resolve_fruit_object(tracker, fruit_class, robot_pose, class_voter)
+  if obj is None:
+    return None
+  return (obj.map_x, obj.map_y)
+
+
 def resolve_fruit_goal(
   tracker: LidarObjectTracker,
   fruit_class: str,
@@ -283,11 +314,7 @@ def resolve_fruit_goal(
   approach_distance: float = 0.5,
   class_voter: Optional[ClusterClassVoter] = None,
 ) -> Optional[tuple[float, float, float]]:
-  obj: Optional[MapObject] = None
-  if class_voter is not None:
-    obj = class_voter.find_object_by_class(tracker, fruit_class, robot_pose)
-  if obj is None:
-    obj = tracker.find_by_class(fruit_class, robot_pose)
+  obj = resolve_fruit_object(tracker, fruit_class, robot_pose, class_voter)
   if obj is None or robot_pose is None:
     return None
   return compute_approach_goal(obj, robot_pose, approach_distance)

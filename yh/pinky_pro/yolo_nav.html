@@ -110,12 +110,25 @@
 
   <div class="panel-card">
     <div class="section-title">Robot</div>
+    <div class="info-line"><span>Robot</span><span class="value"><select id="robotSelect" style="width:180px;background:transparent;color:#e5e7eb;border:1px solid rgba(255,255,255,0.12);border-radius:8px;padding:2px 6px;"></select></span></div>
     <div class="info-line"><span>Pose</span><span class="value" id="poseText">-</span></div>
     <div class="info-line"><span>Ultrasonic</span><span class="value" id="usText">-</span></div>
     <div class="info-line">
       <span><span id="navStatusDot" class="nav-status-dot"></span><span id="navStatusText">Idle</span></span>
     </div>
     <button id="btnNavStop" class="btn btn-danger" disabled>Stop Navigation</button>
+  </div>
+
+  <div class="panel-card">
+    <div class="section-title">Order (Kitchen)</div>
+    <div class="fruit-row">
+      <button class="btn btn-primary" data-recipe="apple_pie">애플파이</button>
+      <button class="btn btn-primary" data-recipe="carrot_soup">당근스프</button>
+      <button class="btn btn-primary" data-recipe="banana_pudding">바나나푸딩</button>
+      <button class="btn btn-primary" data-recipe="orange">오렌지(젤리)</button>
+    </div>
+    <div class="tiny-note" id="orderStatusText">주문 없음</div>
+    <button id="btnOrderCancel" class="btn btn-outline">주문 취소</button>
   </div>
 
   <div class="panel-card">
@@ -132,6 +145,14 @@
       <button class="btn btn-fruit" data-fruit="carrot">Carrot</button>
     </div>
     <div class="tiny-note">LiDAR map 좌표 + YOLO 클래스로 목표 설정</div>
+  </div>
+
+  <div class="panel-card" id="exchangePanel" style="display:none;">
+    <div class="section-title">교환장소 (Kitchen)</div>
+    <div class="info-line"><span>Saved</span><span class="value" id="exchangeText">-</span></div>
+    <button id="btnSetExchange" class="btn btn-outline">현재 위치를 교환장소로 저장</button>
+    <button id="btnGoExchange" class="btn btn-primary">교환장소로 이동 (큐)</button>
+    <div class="tiny-note">선택한 로봇 맵 좌표 기준. A/B 각각 저장하세요.</div>
   </div>
 
   <div class="panel-card">
@@ -158,6 +179,7 @@
   <div class="panel-card object-colors">
     <div class="section-title">Detected Objects</div>
     <div id="objectList">-</div>
+    <button id="btnClearLabels" class="btn btn-outline" style="margin-top:8px;">클래스 인식 초기화</button>
   </div>
 </div>
 
@@ -165,6 +187,9 @@
 const canvas = document.getElementById("mapCanvas");
 const ctx = canvas.getContext("2d");
 let latestState = null;
+let kitchenMode = false;
+let robots = [];
+let selectedRobotId = "";
 let clickMode = "goal";
 let isDraggingGoal = false;
 let goalStartWorld = null;
@@ -243,12 +268,37 @@ document.getElementById("toggleLidarLabeled").addEventListener("change", (e) => 
 document.querySelectorAll(".btn-fruit").forEach(btn => {
   btn.addEventListener("click", async () => {
     const fruit = btn.dataset.fruit;
-    await fetch("/api/queue/add", {
+    if (kitchenMode && selectedRobotId) {
+      await fetch(`/api/robots/${selectedRobotId}/queue/add`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "fruit", params: { class: fruit } }),
+      });
+    } else {
+      await fetch("/api/queue/add", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "fruit", params: { class: fruit } }),
+      });
+    }
+  });
+});
+
+document.querySelectorAll("[data-recipe]").forEach(btn => {
+  btn.addEventListener("click", async () => {
+    const recipe = btn.dataset.recipe;
+    await fetch("/api/order", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type: "fruit", params: { class: fruit } }),
+      body: JSON.stringify({ recipe }),
     });
+    fetchOrderStatus();
   });
+});
+
+document.getElementById("btnOrderCancel").addEventListener("click", async () => {
+  await fetch("/api/order/cancel", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  fetchOrderStatus();
 });
 
 document.getElementById("btnSetHome").addEventListener("click", async () => {
@@ -259,12 +309,9 @@ document.getElementById("btnGoHome").addEventListener("click", async () => {
   await fetch("/api/home/go", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
 });
 
-document.getElementById("btnNavStop").addEventListener("click", async () => {
-  await fetch("/api/nav/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-});
-
-document.getElementById("btnStopAll").addEventListener("click", async () => {
-  await fetch("/api/queue/stop_all", {
+document.getElementById("btnSetExchange").addEventListener("click", async () => {
+  if (!kitchenMode || !selectedRobotId) return;
+  await fetch(`/api/robots/${selectedRobotId}/exchange/set`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: "{}",
@@ -272,8 +319,56 @@ document.getElementById("btnStopAll").addEventListener("click", async () => {
   fetchState();
 });
 
+document.getElementById("btnGoExchange").addEventListener("click", async () => {
+  if (!kitchenMode || !selectedRobotId) return;
+  await fetch(`/api/robots/${selectedRobotId}/exchange/go`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  fetchState();
+});
+
+document.getElementById("btnNavStop").addEventListener("click", async () => {
+  if (kitchenMode && selectedRobotId) {
+    await fetch(`/api/robots/${selectedRobotId}/nav/stop`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  } else {
+    await fetch("/api/nav/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  }
+});
+
+document.getElementById("btnStopAll").addEventListener("click", async () => {
+  if (kitchenMode) {
+    await fetch("/api/order/cancel", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  } else {
+    await fetch("/api/queue/stop_all", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+  }
+  fetchState();
+});
+
 document.getElementById("btnClearQueue").addEventListener("click", async () => {
   await fetch("/api/queue/clear", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+});
+
+document.getElementById("btnClearLabels").addEventListener("click", async () => {
+  if (kitchenMode && selectedRobotId) {
+    await fetch(`/api/robots/${selectedRobotId}/labels/clear`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+  } else {
+    await fetch("/api/labels/clear", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+  }
+  fetchState();
 });
 
 document.getElementById("btnModeGoal").addEventListener("click", () => setClickMode("goal"));
@@ -349,9 +444,16 @@ function renderObjects(objects, trackerObjects) {
 
 async function fetchState() {
   try {
-    const res = await fetch("/api/state");
-    if (!res.ok) return;
-    latestState = await res.json();
+    if (kitchenMode && selectedRobotId) {
+      const res = await fetch(`/api/robots/${selectedRobotId}/state`);
+      if (!res.ok) return;
+      const payload = await res.json();
+      latestState = payload.state;
+    } else {
+      const res = await fetch("/api/state");
+      if (!res.ok) return;
+      latestState = await res.json();
+    }
     drawState();
     document.getElementById("updateText").textContent = new Date().toLocaleTimeString();
     if (latestState.pose) {
@@ -370,6 +472,11 @@ async function fetchState() {
       document.getElementById("homeText").textContent = h.set
         ? `(${h.x.toFixed(2)}, ${h.y.toFixed(2)})` : "미설정";
     }
+    if (latestState.exchange_pose) {
+      const ex = latestState.exchange_pose;
+      document.getElementById("exchangeText").textContent = ex.set
+        ? `(${ex.x.toFixed(2)}, ${ex.y.toFixed(2)}, yaw=${ex.yaw.toFixed(2)})` : "미설정";
+    }
     updateNavStatus(!!latestState.navigating);
     renderQueue(latestState.queue);
     renderObjects(latestState.map_objects, latestState.tracker_objects);
@@ -379,6 +486,42 @@ async function fetchState() {
     document.getElementById("lidarStatsText").textContent =
       `${pts.length} pts / ${cls.length} clusters (${labeledCount} labeled)`;
   } catch (e) { console.error(e); }
+}
+
+async function fetchOrderStatus() {
+  if (!kitchenMode) return;
+  try {
+    const res = await fetch("/api/order/status");
+    if (!res.ok) return;
+    const s = await res.json();
+    const step = s.step ? ` · ${s.step}` : "";
+    const msg = s.message ? ` · ${s.message}` : "";
+    document.getElementById("orderStatusText").textContent = `${s.status || "?"}${step}${msg}`;
+  } catch (e) { /* ignore */ }
+}
+
+async function initKitchen() {
+  try {
+    const res = await fetch("/api/robots");
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data.success) return;
+    kitchenMode = true;
+    robots = data.robots || [];
+    document.getElementById("exchangePanel").style.display = "block";
+    const sel = document.getElementById("robotSelect");
+    sel.innerHTML = robots.map(r => `<option value="${r.id}">${r.id} (${r.role})</option>`).join("");
+    selectedRobotId = robots[0]?.id || "";
+    if (selectedRobotId) {
+      document.getElementById("videoFeed").src = `/api/robots/${selectedRobotId}/video_feed`;
+    }
+    sel.addEventListener("change", () => {
+      selectedRobotId = sel.value;
+      document.getElementById("videoFeed").src = `/api/robots/${selectedRobotId}/video_feed`;
+      fetchState();
+    });
+    fetchOrderStatus();
+  } catch (e) { /* ignore */ }
 }
 
 function drawState() {
@@ -501,6 +644,29 @@ function drawState() {
     ctx.beginPath(); ctx.moveTo(rx, ry); ctx.lineTo(hx, hy); ctx.stroke();
   }
 
+  const exchange = latestState.exchange_pose;
+  if (exchange && exchange.set) {
+    const [ex, ey] = worldToCanvas(exchange.x, exchange.y);
+    ctx.strokeStyle = "#a855f7";
+    ctx.fillStyle = "rgba(168, 85, 247, 0.35)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(ex, ey, 10, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.stroke();
+    const ehx = ex + 18 * Math.cos(-exchange.yaw);
+    const ehy = ey + 18 * Math.sin(-exchange.yaw);
+    ctx.beginPath();
+    ctx.moveTo(ex, ey);
+    ctx.lineTo(ehx, ehy);
+    ctx.stroke();
+    ctx.fillStyle = "#f5f3ff";
+    ctx.font = "bold 10px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("EX", ex, ey - 14);
+    ctx.textAlign = "left";
+  }
+
   if (isDraggingGoal && goalStartWorld && goalCurrentCanvas) {
     const [sx, sy] = worldToCanvas(goalStartWorld.x, goalStartWorld.y);
     const color = clickMode === "initialpose" ? "#22c55e" : "#fb7185";
@@ -576,7 +742,11 @@ canvas.addEventListener("pointermove", onPointerMove);
 canvas.addEventListener("pointerup", onPointerUp);
 canvas.addEventListener("pointerleave", () => { isDraggingGoal = false; });
 
-setInterval(fetchState, 500);
+initKitchen();
+setInterval(() => {
+  fetchState();
+  fetchOrderStatus();
+}, 500);
 fetchState();
 </script>
 </body>

@@ -104,6 +104,14 @@ class ClusterClassVoter:
   def is_labeled(self, object_id: str) -> bool:
     return object_id in self._labels
 
+  def clear_all(self) -> int:
+    """Drop all pending votes and display labels. Returns removed label count."""
+    removed = len(self._labels)
+    self._votes.clear()
+    self._labels.clear()
+    self._last_eval = 0.0
+    return removed
+
   def get_label_near(
     self,
     tracker: LidarObjectTracker,

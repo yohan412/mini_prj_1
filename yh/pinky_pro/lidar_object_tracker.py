@@ -554,6 +554,19 @@ class LidarObjectTracker:
       self._consolidate_same_class_objects()
       return True
 
+  def clear_all_classes(self) -> int:
+    """Unlock every tracked object and remove class labels. Returns cleared count."""
+    with self._lock:
+      cleared = 0
+      for obj in self._objects.values():
+        if obj.obj_class is None and not obj.locked:
+          continue
+        obj.obj_class = None
+        obj.confidence = 0.0
+        obj.locked = False
+        cleared += 1
+      return cleared
+
   def get_object_by_id(self, object_id: str) -> Optional[MapObject]:
     with self._lock:
       return self._objects.get(object_id)
