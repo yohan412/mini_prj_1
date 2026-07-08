@@ -128,6 +128,70 @@ def cluster_centroid(cluster: list[tuple[float, float, float]]) -> tuple[float, 
   return cx, cy, math.atan2(cy, cx)
 
 
+def _bearing_diff_rad(a: float, b: float) -> float:
+  diff = abs(a - b)
+  return min(diff, 2.0 * math.pi - diff)
+
+
+def merge_nearby_lidar_clusters(
+  clusters: list[LidarCluster],
+  *,
+  merge_distance: float = 0.35,
+  merge_bearing_rad: float = math.radians(8.0),
+) -> list[LidarCluster]:
+  """Merge side-by-side clusters that likely belong to one physical object."""
+  if len(clusters) < 2:
+    return clusters
+
+  used = [False] * len(clusters)
+  merged: list[LidarCluster] = []
+
+  for i, seed in enumerate(clusters):
+    if used[i]:
+      continue
+    used[i] = True
+    map_x, map_y = seed.map_x, seed.map_y
+    base_x, base_y = seed.base_x, seed.base_y
+    distance = seed.distance
+    bearing_rad = seed.bearing_rad
+    point_count = seed.point_count
+
+    changed = True
+    while changed:
+      changed = False
+      for j, other in enumerate(clusters):
+        if used[j]:
+          continue
+        if math.hypot(other.map_x - map_x, other.map_y - map_y) > merge_distance:
+          continue
+        if _bearing_diff_rad(other.bearing_rad, bearing_rad) > merge_bearing_rad:
+          continue
+        used[j] = True
+        total = point_count + other.point_count
+        map_x = (map_x * point_count + other.map_x * other.point_count) / total
+        map_y = (map_y * point_count + other.map_y * other.point_count) / total
+        base_x = (base_x * point_count + other.base_x * other.point_count) / total
+        base_y = (base_y * point_count + other.base_y * other.point_count) / total
+        distance = (distance * point_count + other.distance * other.point_count) / total
+        bearing_rad = math.atan2(base_y, base_x)
+        point_count = total
+        changed = True
+
+    merged.append(
+      LidarCluster(
+        base_x=base_x,
+        base_y=base_y,
+        map_x=map_x,
+        map_y=map_y,
+        distance=distance,
+        bearing_rad=bearing_rad,
+        point_count=point_count,
+      )
+    )
+
+  return merged
+
+
 def base_to_map(
   base_x: float,
   base_y: float,
@@ -169,6 +233,9 @@ class LidarObjectTracker:
     object_ttl: float = 10.0,
     locked_object_ttl: float = 300.0,
     map_match_tolerance: float = 0.2,
+    cluster_merge_distance: float = 0.35,
+    cluster_merge_bearing_deg: float = 8.0,
+    same_class_merge_tolerance: float = 0.35,
     min_cluster_points: int = 2,
     label_confidence: float = 0.8,
   ):
@@ -177,6 +244,9 @@ class LidarObjectTracker:
     self.object_ttl = object_ttl
     self.locked_object_ttl = locked_object_ttl
     self.map_match_tolerance = map_match_tolerance
+    self.cluster_merge_distance = cluster_merge_distance
+    self.cluster_merge_bearing_rad = math.radians(cluster_merge_bearing_deg)
+    self.same_class_merge_tolerance = same_class_merge_tolerance
     self.min_cluster_points = min_cluster_points
     self.label_confidence = label_confidence
 
@@ -240,13 +310,56 @@ class LidarObjectTracker:
         )
       )
 
+    dynamic_clusters = merge_nearby_lidar_clusters(
+      dynamic_clusters,
+      merge_distance=self.cluster_merge_distance,
+      merge_bearing_rad=self.cluster_merge_bearing_rad,
+    )
+
     with self._lock:
       self._latest_clusters = dynamic_clusters
       self._latest_scan_points = scan_points_map
       self._merge_clusters(dynamic_clusters, now)
+      self._consolidate_same_class_objects()
       self._expire_objects(now)
 
     return dynamic_clusters
+
+  def _consolidate_same_class_objects(self) -> None:
+    """Treat adjacent locked objects with the same class as one object."""
+    tol = self.same_class_merge_tolerance
+    locked = [
+      obj for obj in self._objects.values()
+      if obj.locked and obj.obj_class
+    ]
+    if len(locked) < 2:
+      return
+
+    remove_ids: set[str] = set()
+    for i, primary in enumerate(locked):
+      if primary.id in remove_ids:
+        continue
+      for secondary in locked[i + 1:]:
+        if secondary.id in remove_ids:
+          continue
+        if primary.obj_class != secondary.obj_class:
+          continue
+        if math.hypot(primary.map_x - secondary.map_x, primary.map_y - secondary.map_y) > tol:
+          continue
+
+        keeper, merged = primary, secondary
+        if merged.confidence > keeper.confidence:
+          keeper, merged = merged, primary
+
+        keeper.map_x = (keeper.map_x + merged.map_x) / 2.0
+        keeper.map_y = (keeper.map_y + merged.map_y) / 2.0
+        keeper.distance = (keeper.distance + merged.distance) / 2.0
+        keeper.bearing_deg = (keeper.bearing_deg + merged.bearing_deg) / 2.0
+        keeper.last_seen = max(keeper.last_seen, merged.last_seen)
+        remove_ids.add(merged.id)
+
+    for obj_id in remove_ids:
+      del self._objects[obj_id]
 
   def _merge_clusters(self, clusters: list[LidarCluster], now: float) -> None:
     for cluster in clusters:
@@ -313,6 +426,33 @@ class LidarObjectTracker:
           best_dist = dist
           best = obj
       return best
+
+  def find_canonical_vote_target(
+    self,
+    map_x: float,
+    map_y: float,
+    class_name: str,
+  ) -> Optional[MapObject]:
+    """Pick one tracker object for votes when detections hit side-by-side clusters."""
+    tol = self.same_class_merge_tolerance
+    cls = class_name.lower()
+    with self._lock:
+      candidates: list[MapObject] = []
+      for obj in self._objects.values():
+        if math.hypot(obj.map_x - map_x, obj.map_y - map_y) > tol:
+          continue
+        if obj.locked and obj.obj_class != cls:
+          continue
+        candidates.append(obj)
+      if not candidates:
+        return None
+
+      def sort_key(obj: MapObject) -> tuple[int, float]:
+        locked_same = int(obj.locked and obj.obj_class == cls)
+        dist = math.hypot(obj.map_x - map_x, obj.map_y - map_y)
+        return (-locked_same, dist)
+
+      return min(candidates, key=sort_key)
 
   def cluster_to_dict(self, cluster: LidarCluster, objects: Optional[dict[str, MapObject]] = None) -> dict[str, Any]:
     result: dict[str, Any] = {
@@ -385,13 +525,18 @@ class LidarObjectTracker:
       obj.map_y = cluster_map_y
       obj.locked = True
       obj.last_seen = time.time()
+      self._consolidate_same_class_objects()
       return True
 
   def lock_object_class(self, object_id: str, obj_class: str, confidence: float) -> bool:
     """Lock class from accumulated votes (no per-frame confidence gate)."""
+    return self.update_object_class(object_id, obj_class, confidence)
+
+  def update_object_class(self, object_id: str, obj_class: str, confidence: float) -> bool:
+    """Set or refresh the labeled class for a tracker object."""
     with self._lock:
       obj = self._objects.get(object_id)
-      if obj is None or obj.locked:
+      if obj is None:
         return False
 
       for other in self._objects.values():
@@ -406,6 +551,7 @@ class LidarObjectTracker:
       obj.confidence = confidence
       obj.locked = True
       obj.last_seen = time.time()
+      self._consolidate_same_class_objects()
       return True
 
   def get_object_by_id(self, object_id: str) -> Optional[MapObject]:

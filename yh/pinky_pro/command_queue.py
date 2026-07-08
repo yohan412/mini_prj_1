@@ -72,6 +72,9 @@ class CommandQueue:
     align_angular_speed: float = 0.4,
     approach_linear_speed: float = 0.06,
     ultrasonic_stop_distance: float = 0.10,
+    stalled_timeout: float = 5.0,
+    stalled_move_tolerance: float = 0.03,
+    stalled_yaw_tolerance: float = 0.05,
   ):
     self.arrival_threshold = arrival_threshold
     self.detection_timeout = detection_timeout
@@ -84,6 +87,9 @@ class CommandQueue:
     self.align_angular_speed = align_angular_speed
     self.approach_linear_speed = approach_linear_speed
     self.ultrasonic_stop_distance = ultrasonic_stop_distance
+    self.stalled_timeout = stalled_timeout
+    self.stalled_move_tolerance = stalled_move_tolerance
+    self.stalled_yaw_tolerance = stalled_yaw_tolerance
 
     self._lock = threading.Lock()
     self._commands: list[NavCommand] = []
@@ -92,6 +98,8 @@ class CommandQueue:
     self._history_limit = 30
     self._last_goal_send = 0.0
     self._current_goal: Optional[GoalTuple] = None
+    self._last_motion_pose: Optional[tuple[float, float, float]] = None
+    self._last_motion_time: float = time.monotonic()
 
     self.resolve_fruit_goal: Optional[Callable[[str], Optional[GoalTuple]]] = None
     self.resolve_home_goal: Optional[Callable[[], Optional[GoalTuple]]] = None
@@ -151,6 +159,17 @@ class CommandQueue:
         self._active = None
       self._current_goal = None
 
+  def stop_all(self) -> dict[str, int]:
+    """Cancel the active command, clear pending queue, and stop the robot."""
+    with self._lock:
+      had_active = self._active is not None
+    self.stop_active()
+    removed_pending = self.clear_pending()
+    return {
+      'cancelled_active': int(had_active),
+      'removed_pending': removed_pending,
+    }
+
   def tick(self) -> None:
     with self._lock:
       if self._active is None:
@@ -161,6 +180,7 @@ class CommandQueue:
         self._active.started_at = time.time()
         self._last_goal_send = 0.0
         self._current_goal = None
+        self._reset_motion_tracker()
 
       active = self._active
 
@@ -208,6 +228,60 @@ class CommandQueue:
     dist = math.hypot(goal[0] - rx, goal[1] - ry)
     navigating = self.is_navigating() if self.is_navigating else False
     return dist < self.arrival_threshold and not navigating
+
+  def _reset_motion_tracker(self) -> None:
+    self._last_motion_pose = None
+    self._last_motion_time = time.monotonic()
+
+  def _normalize_yaw_delta(self, a: float, b: float) -> float:
+    delta = a - b
+    while delta > math.pi:
+      delta -= 2.0 * math.pi
+    while delta < -math.pi:
+      delta += 2.0 * math.pi
+    return abs(delta)
+
+  def _track_robot_motion(self) -> None:
+    if self.get_robot_pose is None:
+      return
+    pose = self.get_robot_pose()
+    if pose is None:
+      return
+
+    now = time.monotonic()
+    if self._last_motion_pose is None:
+      self._last_motion_pose = pose
+      self._last_motion_time = now
+      return
+
+    rx, ry, ryaw = pose
+    lx, ly, lyaw = self._last_motion_pose
+    moved = (
+      math.hypot(rx - lx, ry - ly) > self.stalled_move_tolerance
+      or self._normalize_yaw_delta(ryaw, lyaw) > self.stalled_yaw_tolerance
+    )
+    if moved:
+      self._last_motion_pose = pose
+      self._last_motion_time = now
+
+  def _stalled_duration(self) -> float:
+    return time.monotonic() - self._last_motion_time
+
+  def _fail_if_stalled(self, command: NavCommand, label: str) -> bool:
+    """Return True when the command was failed due to stall timeout."""
+    self._track_robot_motion()
+    if self._stalled_duration() < self.stalled_timeout:
+      return False
+    if self.cancel_navigation:
+      self.cancel_navigation()
+    if self.stop_robot:
+      self.stop_robot()
+    self._finish(
+      command,
+      CommandStatus.FAILED,
+      f'{label} stalled timeout ({self.stalled_timeout:.0f}s)',
+    )
+    return True
 
   def _tick_fruit(self, command: NavCommand) -> None:
     fruit_class = command.params.get('class', '')
@@ -349,6 +423,9 @@ class CommandQueue:
       self._finish(command, CommandStatus.COMPLETED, 'Arrived at home')
 
   def _tick_pose(self, command: NavCommand) -> None:
+    if self._fail_if_stalled(command, 'Pose navigation'):
+      return
+
     try:
       x = float(command.params['x'])
       y = float(command.params['y'])

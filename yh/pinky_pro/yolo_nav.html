@@ -79,7 +79,7 @@
       <span class="info-line" style="margin:0;"><span id="updateText">-</span></span>
     </div>
     <canvas id="mapCanvas" width="640" height="480"></canvas>
-    <div class="tiny-note">빨강: LiDAR hit · 청록 원: 미확인 · 색 원+라벨: 3초 누적 점수로 확정된 클래스</div>
+    <div class="tiny-note">빨강: LiDAR hit · 청록 원: 미확인 · 색 원+라벨: 3초마다 갱신되는 누적 점수 1위 클래스</div>
   </div>
 </div>
 
@@ -150,6 +150,7 @@
 
   <div class="panel-card">
     <div class="section-title">Command Queue</div>
+    <button id="btnStopAll" class="btn btn-danger" style="margin-top:0;margin-bottom:8px;" disabled>모든 명령 중지</button>
     <div id="queueList"></div>
     <button id="btnClearQueue" class="btn btn-outline">Clear Pending</button>
   </div>
@@ -206,12 +207,13 @@ function drawClusterLabel(cx, cy, cl) {
   ctx.fill();
   ctx.stroke();
   const conf = cl.confidence != null ? ` ${(cl.confidence * 100).toFixed(0)}%` : "";
-  drawMapLabel(`${cl.class}${conf}`, cx, cy, cl.class, -14);
+  const score = cl.vote_score != null ? ` s=${cl.vote_score.toFixed(1)}` : "";
+  drawMapLabel(`${cl.class}${conf}${score}`, cx, cy, cl.class, -14);
 }
 
 function clusterNear(x, y, clusters, tol = 0.25) {
   return clusters.some(cl =>
-    cl.locked && cl.class &&
+    cl.class &&
     Math.hypot(cl.map_x - x, cl.map_y - y) < tol
   );
 }
@@ -261,6 +263,15 @@ document.getElementById("btnNavStop").addEventListener("click", async () => {
   await fetch("/api/nav/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
 });
 
+document.getElementById("btnStopAll").addEventListener("click", async () => {
+  await fetch("/api/queue/stop_all", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  fetchState();
+});
+
 document.getElementById("btnClearQueue").addEventListener("click", async () => {
   await fetch("/api/queue/clear", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
 });
@@ -281,10 +292,18 @@ function updateNavStatus(navigating) {
   document.getElementById("btnNavStop").disabled = !navigating;
 }
 
+function updateQueueActions(queue) {
+  const hasActiveOrPending = (queue || []).some(
+    cmd => cmd.status === "running" || cmd.status === "pending"
+  );
+  document.getElementById("btnStopAll").disabled = !hasActiveOrPending;
+}
+
 function renderQueue(queue) {
   const el = document.getElementById("queueList");
   if (!queue || queue.length === 0) {
     el.innerHTML = '<div class="tiny-note">큐가 비어 있습니다.</div>';
+    updateQueueActions(queue);
     return;
   }
   el.innerHTML = queue.map(cmd => {
@@ -296,21 +315,28 @@ function renderQueue(queue) {
       <span class="status-pill">${cmd.status}</span>
     </div>`;
   }).join("");
+  updateQueueActions(queue);
 }
 
 function renderObjects(objects, trackerObjects) {
   const el = document.getElementById("objectList");
-  const labeled = (objects || []).filter(o => o.locked && o.class);
-  const unlabeled = (trackerObjects || []).filter(o => !o.locked || !o.class);
+  const labeled = (objects || []).filter(o => o.class);
+  const unlabeled = (trackerObjects || []).filter(o => {
+    if (o.map_x == null) return false;
+    return !labeled.some(l =>
+      Math.hypot((l.map_x || 0) - o.map_x, (l.map_y || 0) - o.map_y) < 0.25
+    );
+  });
   if (labeled.length === 0 && unlabeled.length === 0) {
     el.textContent = "감지된 객체 없음";
     return;
   }
   let html = "";
   if (labeled.length > 0) {
-    html += labeled.map(o =>
-      `<div>${o.class} @ (${o.map_x?.toFixed(2)}, ${o.map_y?.toFixed(2)}) conf=${(o.confidence||0).toFixed(2)} [고정]</div>`
-    ).join("");
+    html += labeled.map(o => {
+      const score = o.vote_score != null ? ` score=${o.vote_score.toFixed(1)}` : "";
+      return `<div>${o.class} @ (${o.map_x?.toFixed(2)}, ${o.map_y?.toFixed(2)}) conf=${(o.confidence||0).toFixed(2)}${score}</div>`;
+    }).join("");
   }
   if (unlabeled.length > 0) {
     html += `<div style="margin-top:4px;color:#9ca3af;">미확인 LiDAR (${unlabeled.length}):</div>`;
@@ -349,7 +375,7 @@ async function fetchState() {
     renderObjects(latestState.map_objects, latestState.tracker_objects);
     const pts = latestState.lidar_points || [];
     const cls = latestState.lidar_clusters || [];
-    const labeledCount = cls.filter(c => c.locked).length;
+    const labeledCount = cls.filter(c => c.class).length;
     document.getElementById("lidarStatsText").textContent =
       `${pts.length} pts / ${cls.length} clusters (${labeledCount} labeled)`;
   } catch (e) { console.error(e); }
@@ -427,7 +453,7 @@ function drawState() {
 
   if (showLidarClusters || showLidarLabeled) {
     lidarClusters.forEach(cl => {
-      const labeled = !!(cl.locked && cl.class);
+      const labeled = !!cl.class;
       if (labeled && !showLidarLabeled) return;
       if (!labeled && !showLidarClusters) return;
       const [cx, cy] = worldToCanvas(cl.map_x, cl.map_y);
@@ -445,8 +471,8 @@ function drawState() {
     });
   }
 
-  // Unlabeled tracker objects (LiDAR only, gray) — skip if shown as locked cluster
-  trackerObjects.filter(o => !o.locked || !o.class).forEach(obj => {
+  // Unlabeled tracker objects (LiDAR only, gray)
+  trackerObjects.forEach(obj => {
     if (clusterNear(obj.map_x, obj.map_y, lidarClusters)) return;
     const [ox, oy] = worldToCanvas(obj.map_x, obj.map_y);
     ctx.fillStyle = "#9ca3af";

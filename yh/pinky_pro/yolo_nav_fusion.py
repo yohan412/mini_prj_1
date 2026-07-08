@@ -62,6 +62,61 @@ def parse_yolo_results(results, model_names: dict[int, str]) -> list[YoloDetecti
   return detections
 
 
+def _detection_xyxy(det: YoloDetection) -> tuple[float, float, float, float]:
+  half_w = det.bbox_w / 2.0
+  half_h = det.bbox_h / 2.0
+  return (
+    det.cx - half_w,
+    det.cy - half_h,
+    det.cx + half_w,
+    det.cy + half_h,
+  )
+
+
+def _bbox_iou(a: YoloDetection, b: YoloDetection) -> float:
+  ax1, ay1, ax2, ay2 = _detection_xyxy(a)
+  bx1, by1, bx2, by2 = _detection_xyxy(b)
+  ix1 = max(ax1, bx1)
+  iy1 = max(ay1, by1)
+  ix2 = min(ax2, bx2)
+  iy2 = min(ay2, by2)
+  if ix2 <= ix1 or iy2 <= iy1:
+    return 0.0
+  inter = (ix2 - ix1) * (iy2 - iy1)
+  area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+  area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+  union = area_a + area_b - inter
+  if union <= 0.0:
+    return 0.0
+  return inter / union
+
+
+def dedupe_same_class_detections(
+  detections: list[YoloDetection],
+  *,
+  iou_threshold: float = 0.25,
+  center_dist_px: float = 48.0,
+) -> list[YoloDetection]:
+  """Drop lower-confidence boxes when same-class detections overlap in image space."""
+  if len(detections) < 2:
+    return detections
+
+  ranked = sorted(detections, key=lambda det: det.confidence, reverse=True)
+  kept: list[YoloDetection] = []
+  for det in ranked:
+    suppress = False
+    for winner in kept:
+      if winner.class_name != det.class_name:
+        continue
+      center_dist = math.hypot(det.cx - winner.cx, det.cy - winner.cy)
+      if center_dist <= center_dist_px or _bbox_iou(det, winner) >= iou_threshold:
+        suppress = True
+        break
+    if not suppress:
+      kept.append(det)
+  return kept
+
+
 def match_detection_to_cluster(
   detection: YoloDetection,
   clusters: list[LidarCluster],
@@ -71,6 +126,7 @@ def match_detection_to_cluster(
   match_angle_rad: float,
   cam_yaw_offset: float = 0.0,
   tracker: Optional[LidarObjectTracker] = None,
+  class_voter: Optional[ClusterClassVoter] = None,
   used_cluster_keys: Optional[set[tuple[float, float]]] = None,
 ) -> Optional[LidarCluster]:
   det_bearing = detection_bearing_robot(
@@ -82,11 +138,6 @@ def match_detection_to_cluster(
     cluster_key = (round(cluster.map_x, 3), round(cluster.map_y, 3))
     if used_cluster_keys is not None and cluster_key in used_cluster_keys:
       continue
-
-    if tracker is not None:
-      nearby = tracker.find_object_near(cluster.map_x, cluster.map_y)
-      if nearby is not None and nearby.locked and nearby.obj_class != detection.class_name:
-        continue
 
     cluster_bearing_map = robot_yaw + cluster.bearing_rad
     diff = abs(_normalize_angle(det_bearing - cluster_bearing_map))
@@ -102,6 +153,28 @@ def _normalize_angle(angle: float) -> float:
   while angle < -math.pi:
     angle += 2.0 * math.pi
   return angle
+
+
+def _apply_display_label(
+  entry: dict[str, Any],
+  tracker: LidarObjectTracker,
+  class_voter: ClusterClassVoter,
+  map_x: float,
+  map_y: float,
+) -> None:
+  label = class_voter.get_label_near(tracker, map_x, map_y)
+  if label is None:
+    return
+  entry['confirmed'] = True
+  entry['labeled'] = label.labeled
+  entry['class'] = label.class_name
+  entry['confidence'] = label.confidence
+  entry['vote_score'] = label.score
+  entry['vote_scores'] = label.scores
+  obj = tracker.get_object_by_id(label.object_id)
+  if obj is not None:
+    entry['map_x'] = obj.map_x
+    entry['map_y'] = obj.map_y
 
 
 def fuse_detections(
@@ -122,6 +195,10 @@ def fuse_detections(
   robot_yaw = robot_pose[2]
   fused: list[dict[str, Any]] = []
   used_cluster_keys: set[tuple[float, float]] = set()
+  detections = dedupe_same_class_detections(detections)
+
+  # Per cluster+class keep only the highest-confidence detection for voting.
+  vote_winners: dict[tuple[str, tuple[float, float]], tuple[YoloDetection, LidarCluster, str]] = {}
 
   for det in detections:
     cluster = match_detection_to_cluster(
@@ -133,6 +210,7 @@ def fuse_detections(
       match_angle_rad,
       cam_yaw_offset,
       tracker=tracker,
+      class_voter=class_voter,
       used_cluster_keys=used_cluster_keys,
     )
     entry: dict[str, Any] = {
@@ -144,7 +222,6 @@ def fuse_detections(
       'map_x': None,
       'map_y': None,
       'confirmed': False,
-      'locked': False,
       'bearing_deg': math.degrees(
         detection_bearing_robot(det, frame_width, robot_yaw, hfov_rad, cam_yaw_offset)
       ),
@@ -155,42 +232,34 @@ def fuse_detections(
 
     cluster_key = (round(cluster.map_x, 3), round(cluster.map_y, 3))
     used_cluster_keys.add(cluster_key)
+    entry['map_x'] = cluster.map_x
+    entry['map_y'] = cluster.map_y
+    entry['distance'] = cluster.distance
 
-    nearby = tracker.find_object_near(cluster.map_x, cluster.map_y)
-    if nearby is not None and nearby.locked:
-      entry['confirmed'] = True
-      entry['locked'] = True
-      entry['class'] = nearby.obj_class
-      entry['confidence'] = nearby.confidence
-      entry['map_x'] = nearby.map_x
-      entry['map_y'] = nearby.map_y
-      entry['distance'] = math.hypot(nearby.map_x - robot_pose[0], nearby.map_y - robot_pose[1])
-    elif class_voter is not None and det.confidence >= label_confidence:
-      target = nearby
-      if target is not None and not target.locked:
-        class_voter.record_match(target.id, det.class_name, det.confidence)
-      entry['map_x'] = cluster.map_x
-      entry['map_y'] = cluster.map_y
-      entry['distance'] = cluster.distance
+    if class_voter is not None:
+      _apply_display_label(entry, tracker, class_voter, cluster.map_x, cluster.map_y)
+
+      if det.confidence >= label_confidence:
+        target = tracker.find_canonical_vote_target(cluster.map_x, cluster.map_y, det.class_name)
+        if target is None:
+          target = tracker.find_object_near(cluster.map_x, cluster.map_y)
+        if target is not None:
+          vote_key = (det.class_name, cluster_key)
+          prev = vote_winners.get(vote_key)
+          if prev is None or det.confidence > prev[0].confidence:
+            vote_winners[vote_key] = (det, cluster, target.id)
 
     fused.append(entry)
 
   if class_voter is not None:
+    for det, _cluster, target_id in vote_winners.values():
+      class_voter.record_match(target_id, det.class_name, det.confidence)
     class_voter.evaluate(tracker)
     for entry in fused:
-      if entry.get('locked'):
-        continue
       mx, my = entry.get('map_x'), entry.get('map_y')
       if mx is None or my is None:
         continue
-      locked = tracker.find_object_near(mx, my)
-      if locked is not None and locked.locked:
-        entry['confirmed'] = True
-        entry['locked'] = True
-        entry['class'] = locked.obj_class
-        entry['confidence'] = locked.confidence
-        entry['map_x'] = locked.map_x
-        entry['map_y'] = locked.map_y
+      _apply_display_label(entry, tracker, class_voter, mx, my)
 
   return fused
 
@@ -212,8 +281,13 @@ def resolve_fruit_goal(
   fruit_class: str,
   robot_pose: Optional[tuple[float, float, float]],
   approach_distance: float = 0.5,
+  class_voter: Optional[ClusterClassVoter] = None,
 ) -> Optional[tuple[float, float, float]]:
-  obj = tracker.find_by_class(fruit_class, robot_pose)
+  obj: Optional[MapObject] = None
+  if class_voter is not None:
+    obj = class_voter.find_object_by_class(tracker, fruit_class, robot_pose)
+  if obj is None:
+    obj = tracker.find_by_class(fruit_class, robot_pose)
   if obj is None or robot_pose is None:
     return None
   return compute_approach_goal(obj, robot_pose, approach_distance)

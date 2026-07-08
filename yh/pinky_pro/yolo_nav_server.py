@@ -123,6 +123,9 @@ class YoloNavBridge(Node):
       align_angular_speed=args.align_angular_speed,
       approach_linear_speed=args.approach_linear_speed,
       ultrasonic_stop_distance=args.ultrasonic_stop_distance,
+      stalled_timeout=args.stalled_timeout,
+      stalled_move_tolerance=args.stalled_move_tolerance,
+      stalled_yaw_tolerance=args.stalled_yaw_tolerance,
     )
     self._wire_queue_callbacks()
 
@@ -299,6 +302,7 @@ class YoloNavBridge(Node):
       fruit_class.lower(),
       self.get_robot_pose(),
       self.args.approach_distance,
+      class_voter=self.class_voter,
     )
 
   def _queue_resolve_home(self):
@@ -367,18 +371,18 @@ class YoloNavBridge(Node):
       label = det.get('class') or '?'
       if det.get('distance') is not None:
         label += f" {det['distance']:.1f}m"
-      if det.get('locked'):
-        label += ' [locked]'
-        cv2.putText(
-          plotted,
-          label,
-          (int(det['cx']), int(det['cy'])),
-          cv2.FONT_HERSHEY_SIMPLEX,
-          0.5,
-          (0, 255, 255),
-          1,
-          cv2.LINE_AA,
-        )
+      if det.get('vote_score') is not None:
+        label += f" ({det['vote_score']:.1f})"
+      cv2.putText(
+        plotted,
+        label,
+        (int(det['cx']), int(det['cy'])),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (0, 255, 255),
+        1,
+        cv2.LINE_AA,
+      )
 
     ok, encoded = cv2.imencode('.jpg', plotted, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
     if ok:
@@ -447,13 +451,45 @@ class YoloNavBridge(Node):
         'data': list(msg.data),
       }
 
-    map_objects = [o.to_dict() for o in self.tracker.get_objects() if o.locked and o.obj_class]
+    map_objects = []
+    for label in self.class_voter.get_display_labels():
+      obj = self.tracker.get_object_by_id(label.object_id)
+      if obj is None:
+        continue
+      map_objects.append({
+        'id': label.object_id,
+        'class': label.class_name,
+        'map_x': obj.map_x,
+        'map_y': obj.map_y,
+        'distance': obj.distance,
+        'bearing_deg': obj.bearing_deg,
+        'confidence': label.confidence,
+        'vote_score': label.score,
+        'vote_scores': label.scores,
+        'updated_at': label.updated_at,
+      })
+
     lidar_clusters = self.tracker.get_clusters_json()
     for cl in lidar_clusters:
-      if cl.get('locked'):
-        cl['status'] = 'confirmed'
+      label = self.class_voter.get_label_near(
+        self.tracker,
+        cl['map_x'],
+        cl['map_y'],
+      )
+      if label is not None:
+        cl['labeled'] = True
+        cl['class'] = label.class_name
+        cl['confidence'] = label.confidence
+        cl['vote_score'] = label.score
+        cl['vote_scores'] = label.scores
+        cl['status'] = 'classified'
         continue
-      nearby = self.tracker.find_object_near(cl['map_x'], cl['map_y'])
+
+      nearby = self.tracker.find_object_near(
+        cl['map_x'],
+        cl['map_y'],
+        tolerance=self.tracker.same_class_merge_tolerance,
+      )
       if nearby is None:
         cl['status'] = 'unknown'
         continue
@@ -601,6 +637,14 @@ def api_home_go():
   return jsonify({'success': True, 'command': cmd.to_dict()})
 
 
+@app.route('/api/queue/stop_all', methods=['POST'])
+def api_queue_stop_all():
+  if ros_node is None:
+    return jsonify({'success': False}), 500
+  result = ros_node.command_queue.stop_all()
+  return jsonify({'success': True, **result})
+
+
 @app.route('/api/nav/stop', methods=['POST'])
 def api_nav_stop():
   if ros_node is None:
@@ -649,8 +693,8 @@ def parse_args():
   parser.add_argument('--imgsz', type=int, default=320)
   parser.add_argument('--max-det', type=int, default=300)
   parser.add_argument('--hfov-deg', type=float, default=66.0)
-  parser.add_argument('--approach-distance', type=float, default=0.5)
-  parser.add_argument('--arrival-threshold', type=float, default=0.3)
+  parser.add_argument('--approach-distance', type=float, default=0.3)
+  parser.add_argument('--arrival-threshold', type=float, default=0.15)
   parser.add_argument('--detection-timeout', type=float, default=30.0)
   parser.add_argument('--goal-update-interval', type=float, default=2.0)
   parser.add_argument('--cluster-angle-tol', type=float, default=3.0)
@@ -675,6 +719,12 @@ def parse_args():
   parser.add_argument('--approach-linear-speed', type=float, default=0.06)
   parser.add_argument('--ultrasonic-stop-distance', type=float, default=0.10,
                       help='Stop forward approach when ultrasonic range falls below this (m)')
+  parser.add_argument('--stalled-timeout', type=float, default=5.0,
+                      help='Fail pose navigation if the robot stays still this long (s)')
+  parser.add_argument('--stalled-move-tolerance', type=float, default=0.03,
+                      help='Pose movement below this distance (m) counts as stopped')
+  parser.add_argument('--stalled-yaw-tolerance', type=float, default=0.05,
+                      help='Yaw change below this (rad) counts as stopped')
   return parser.parse_args()
 
 

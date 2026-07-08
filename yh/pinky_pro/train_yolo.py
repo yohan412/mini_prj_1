@@ -30,7 +30,7 @@ def parse_args():
   parser = argparse.ArgumentParser(description='Train YOLOv8 with a prepared dataset')
   parser.add_argument('--data', default=str(DEFAULT_DATA_YAML), help='Path to data.yaml')
   parser.add_argument('--model', default=str(DEFAULT_BASE_MODEL), help='Base model (.pt)')
-  parser.add_argument('--epochs', type=int, default=200)
+  parser.add_argument('--epochs', type=int, default=100)
   parser.add_argument('--imgsz', type=int, default=640)
   parser.add_argument('--batch', type=int, default=16)
   parser.add_argument('--project', default=str(DEFAULT_PROJECT), help='Training output directory')
