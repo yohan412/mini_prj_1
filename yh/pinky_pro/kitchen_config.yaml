@@ -1,5 +1,6 @@
 robots:
   robot_a:
+    # 재료(apple, orange, carrot, banana) 맵 → supplier
     role: supplier
     bridge_url: http://192.168.129.130:8091
     stream_url: http://192.168.129.130:5000/video
@@ -8,12 +9,11 @@ robots:
       approach_distance: 0.3
       arrival_threshold: 0.25
       label_confidence: 0.8
-    # Empty list = classify anywhere. Add rectangles to restrict labeling.
-    # map-frame meters: min_x/max_x/min_y/max_y
     classify_zones: []
     # classify_zones:
     #   - { name: ingredients, min_x: 0.5, max_x: 2.0, min_y: -0.5, max_y: 1.5 }
   robot_b:
+    # 요리(apple_pie, jelly, …)·손님(bell) 맵 → server
     role: server
     bridge_url: http://192.168.129.24:8091
     stream_url: http://192.168.129.24:5000/video
@@ -31,14 +31,16 @@ recipes:
   apple_pie: { ingredient: apple, dish: apple_pie }
   carrot_soup: { ingredient: carrot, dish: carrot_soup }
   banana_pudding: { ingredient: banana, dish: banana_pudding }
-  orange: { ingredient: jelly, dish: orange }
+  orange: { ingredient: orange, dish: jelly }
 
 classes:
-  ingredients: [apple, banana, carrot, jelly]
-  dishes: [apple_pie, carrot_soup, banana_pudding, orange]
+  ingredients: [apple, banana, carrot, orange]
+  dishes: [apple_pie, carrot_soup, banana_pudding, jelly]
   customer: bell
 
 orchestrator:
+  supplier_robot: robot_a
+  server_robot: robot_b
   handoff_mode: both_arrived
   detection_timeout: 30.0
   handoff_timeout: 120.0
