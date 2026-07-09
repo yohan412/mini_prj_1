@@ -723,9 +723,21 @@ async function onPointerUp(e) {
   const body = { x: goalStartWorld.x, y: goalStartWorld.y, yaw };
 
   if (clickMode === "initialpose") {
-    await fetch("/api/initialpose", {
+    if (kitchenMode && selectedRobotId) {
+      await fetch(`/api/robots/${selectedRobotId}/initialpose`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } else {
+      await fetch("/api/initialpose", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    }
+  } else if (kitchenMode && selectedRobotId) {
+    await fetch(`/api/robots/${selectedRobotId}/queue/add`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ type: "pose", params: body }),
     });
   } else {
     await fetch("/api/goal", {
@@ -735,6 +747,7 @@ async function onPointerUp(e) {
   }
   goalStartWorld = null;
   goalCurrentCanvas = null;
+  fetchState();
 }
 
 canvas.addEventListener("pointerdown", onPointerDown);

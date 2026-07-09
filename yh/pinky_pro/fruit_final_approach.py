@@ -17,8 +17,9 @@ class FinalApproachConfig:
   ultrasonic_stop_distance: float = 0.10
   ultrasonic_min_valid: float = 0.03
   ultrasonic_max_valid: float = 2.5
-  align_timeout: float = 25.0
+  align_timeout: float = 10.0
   approach_timeout: float = 20.0
+  align_distance_tolerance: float = 0.05
   # Legacy camera fields (kept for compatibility with old callers)
   align_tolerance_px: float = 20.0
 
@@ -57,6 +58,88 @@ def is_heading_aligned(
   config: FinalApproachConfig,
 ) -> bool:
   return abs(bearing_error_rad(robot_pose, target_xy)) <= config.align_tolerance_rad
+
+
+def lidar_range_to_target(
+  robot_pose: tuple[float, float, float],
+  target_xy: tuple[float, float],
+) -> float:
+  """Planar distance from robot to the frozen LiDAR map target (m)."""
+  rx, ry, _ = robot_pose
+  tx, ty = target_xy
+  return math.hypot(tx - rx, ty - ry)
+
+
+def is_lidar_distance_at_target(
+  lidar_range: float,
+  target_distance: float,
+  tolerance: float,
+) -> bool:
+  return abs(lidar_range - target_distance) <= tolerance
+
+
+def is_ultrasonic_distance_at_target(
+  range_m: Optional[float],
+  target_distance: float,
+  config: FinalApproachConfig,
+  tolerance: float,
+) -> bool:
+  if not is_valid_ultrasonic(range_m, config):
+    return False
+  assert range_m is not None
+  return abs(range_m - target_distance) <= tolerance
+
+
+def is_fruit_arrival_by_distance(
+  robot_pose: Optional[tuple[float, float, float]],
+  target_xy: Optional[tuple[float, float]],
+  ultrasonic_range: Optional[float],
+  target_distance: float,
+  config: FinalApproachConfig,
+  *,
+  allow_ultrasonic_stop: bool = False,
+) -> tuple[bool, str]:
+  """LiDAR or ultrasonic within tolerance counts as arrived."""
+  tol = config.align_distance_tolerance
+
+  if robot_pose is not None and target_xy is not None:
+    lidar_range = lidar_range_to_target(robot_pose, target_xy)
+    if is_lidar_distance_at_target(lidar_range, target_distance, tol):
+      return True, f'LiDAR {lidar_range:.2f}m'
+
+  if is_valid_ultrasonic(ultrasonic_range, config):
+    assert ultrasonic_range is not None
+    if is_ultrasonic_distance_at_target(
+      ultrasonic_range, target_distance, config, tol,
+    ):
+      return True, f'ultrasonic {ultrasonic_range:.2f}m'
+    if allow_ultrasonic_stop and ultrasonic_range <= (
+      config.ultrasonic_stop_distance + tol
+    ):
+      return True, f'ultrasonic {ultrasonic_range:.2f}m (final)'
+
+  return False, ''
+
+
+def is_fine_align_complete(
+  robot_pose: tuple[float, float, float],
+  target_xy: tuple[float, float],
+  ultrasonic_range: Optional[float],
+  target_distance: float,
+  config: FinalApproachConfig,
+) -> bool:
+  """Heading, LiDAR range, and (when available) ultrasonic must agree on standoff."""
+  if not is_heading_aligned(robot_pose, target_xy, config):
+    return False
+  lidar_range = lidar_range_to_target(robot_pose, target_xy)
+  tol = config.align_distance_tolerance
+  if not is_lidar_distance_at_target(lidar_range, target_distance, tol):
+    return False
+  if is_valid_ultrasonic(ultrasonic_range, config):
+    return is_ultrasonic_distance_at_target(
+      ultrasonic_range, target_distance, config, tol,
+    )
+  return True
 
 
 def compute_lidar_align_cmd(

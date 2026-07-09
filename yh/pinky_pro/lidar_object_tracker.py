@@ -382,11 +382,10 @@ class LidarObjectTracker:
         )
       else:
         obj = self._objects[matched_id]
-        if not obj.locked:
-          obj.map_x = cluster.map_x
-          obj.map_y = cluster.map_y
-          obj.distance = cluster.distance
-          obj.bearing_deg = bearing_deg
+        obj.map_x = cluster.map_x
+        obj.map_y = cluster.map_y
+        obj.distance = cluster.distance
+        obj.bearing_deg = bearing_deg
         obj.last_seen = now
 
   def _expire_objects(self, now: float) -> None:
@@ -441,7 +440,7 @@ class LidarObjectTracker:
       for obj in self._objects.values():
         if math.hypot(obj.map_x - map_x, obj.map_y - map_y) > tol:
           continue
-        if obj.locked and obj.obj_class != cls:
+        if cls and obj.locked and obj.obj_class != cls:
           continue
         candidates.append(obj)
       if not candidates:
@@ -534,20 +533,25 @@ class LidarObjectTracker:
 
   def update_object_class(self, object_id: str, obj_class: str, confidence: float) -> bool:
     """Set or refresh the labeled class for a tracker object."""
+    cls = obj_class.lower()
     with self._lock:
       obj = self._objects.get(object_id)
       if obj is None:
         return False
 
+      stale_ids: list[str] = []
       for other in self._objects.values():
         if other.id == obj.id or not other.locked or not other.obj_class:
           continue
-        if other.obj_class == obj_class:
+        if other.obj_class == cls:
           continue
-        if math.hypot(other.map_x - obj.map_x, other.map_y - obj.map_y) <= self.map_match_tolerance:
-          return False
+        if math.hypot(other.map_x - obj.map_x, other.map_y - obj.map_y) <= self.same_class_merge_tolerance:
+          stale_ids.append(other.id)
 
-      obj.obj_class = obj_class
+      for other_id in stale_ids:
+        del self._objects[other_id]
+
+      obj.obj_class = cls
       obj.confidence = confidence
       obj.locked = True
       obj.last_seen = time.time()

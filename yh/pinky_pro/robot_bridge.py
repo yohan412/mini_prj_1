@@ -22,7 +22,7 @@ import rclpy
 from action_msgs.msg import GoalStatus, GoalStatusArray
 from action_msgs.srv import CancelGoal
 from flask import Flask, jsonify, request
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from nav2_msgs.msg import Costmap
 from nav_msgs.msg import OccupancyGrid, Path as NavPath
@@ -129,7 +129,8 @@ class RobotBridge(Node):
 
     self.nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
     self.cancel_client = self.create_client(CancelGoal, "navigate_to_pose/_action/cancel_goal")
-    self.cmd_vel_pub = self.create_publisher(Twist, "cmd_vel", 10)
+    self.cmd_vel_pub = self.create_publisher(Twist, "cmd_vel_nav", 10)
+    self.initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, "initialpose", 10)
 
     self.create_timer(0.1, self._update_pose_from_tf)
     self.create_timer(0.1, self._process_tracking)
@@ -284,10 +285,35 @@ class RobotBridge(Node):
       self._is_navigating = False
     return True
 
+  def set_initial_pose(self, x: float, y: float, yaw: float) -> bool:
+    msg = PoseWithCovarianceStamped()
+    msg.header.frame_id = "map"
+    msg.header.stamp = self.get_clock().now().to_msg()
+    msg.pose.pose.position.x = x
+    msg.pose.pose.position.y = y
+    msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+    msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+    msg.pose.covariance[0] = 0.25
+    msg.pose.covariance[7] = 0.25
+    msg.pose.covariance[35] = 0.06853891909122467
+    self.initial_pose_pub.publish(msg)
+    self.get_logger().info(f"[INIT] pose x={x:.2f} y={y:.2f} yaw={yaw:.2f}")
+    return True
+
   def update_label_near(self, map_x: float, map_y: float, cls: str, confidence: float) -> bool:
     if not allows_classification(map_x, map_y, self.classify_zones):
       return False
-    target = self.tracker.find_object_near(map_x, map_y, tolerance=self.tracker.same_class_merge_tolerance)
+    target = self.tracker.find_canonical_vote_target(
+      map_x,
+      map_y,
+      cls,
+    )
+    if target is None:
+      target = self.tracker.find_object_near(
+        map_x,
+        map_y,
+        tolerance=self.tracker.same_class_merge_tolerance,
+      )
     if target is None:
       return False
     return self.tracker.update_object_class(target.id, cls.lower(), float(confidence))
@@ -410,6 +436,21 @@ def api_nav_stop():
   return jsonify({"success": True})
 
 
+@app.post("/api/initialpose")
+def api_initialpose():
+  if ros_node is None:
+    return jsonify({"success": False}), 500
+  data = request.get_json() or {}
+  try:
+    x = float(data["x"])
+    y = float(data["y"])
+    yaw = float(data.get("yaw", 0.0))
+  except Exception:
+    return jsonify({"success": False, "error": "invalid payload"}), 400
+  ok = ros_node.set_initial_pose(x, y, yaw)
+  return jsonify({"success": ok})
+
+
 @app.post("/api/labels/update")
 def api_labels_update():
   if ros_node is None:
@@ -446,7 +487,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--detection-timeout", type=float, default=30.0)
   parser.add_argument("--goal-update-interval", type=float, default=2.0)
   parser.add_argument("--fine-approach-enabled", action=argparse.BooleanOptionalAction, default=True)
-  parser.add_argument("--align-timeout", type=float, default=25.0)
+  parser.add_argument("--align-timeout", type=float, default=10.0)
   parser.add_argument("--approach-timeout", type=float, default=20.0)
   parser.add_argument("--align-tolerance-px", type=float, default=20.0)
   parser.add_argument("--align-angular-speed", type=float, default=0.4)
@@ -454,7 +495,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--ultrasonic-stop-distance", type=float, default=0.10)
 
   # Stall detection for pose/home
-  parser.add_argument("--stalled-timeout", type=float, default=5.0)
+  parser.add_argument("--stalled-timeout", type=float, default=10.0)
   parser.add_argument("--stalled-move-tolerance", type=float, default=0.03)
   parser.add_argument("--stalled-yaw-tolerance", type=float, default=0.05)
 

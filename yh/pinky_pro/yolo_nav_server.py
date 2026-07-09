@@ -168,6 +168,17 @@ class BridgeClient:
     except (urllib.error.URLError, TimeoutError, ValueError):
       return None
 
+  def set_initial_pose(self, x: float, y: float, yaw: float) -> bool:
+    try:
+      res = _http_json(
+        "POST",
+        f"{self.bridge_url}/api/initialpose",
+        {"x": x, "y": y, "yaw": yaw},
+      )
+      return bool(res and res.get("success"))
+    except (urllib.error.URLError, TimeoutError, ValueError):
+      return False
+
 
 class KitchenManager:
   def __init__(self, cfg: dict[str, Any], model_path: Path):
@@ -480,7 +491,7 @@ class YoloNavBridge(Node):
     self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
     self.cancel_client = self.create_client(CancelGoal, 'navigate_to_pose/_action/cancel_goal')
     self.initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, 'initialpose', 10)
-    self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+    self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel_nav', 10)
 
     self.model = YOLO(str(args.model))
     self.target_class_ids = resolve_target_class_ids(self.model, TARGET_CLASS_NAMES)
@@ -965,6 +976,25 @@ def api_robot_queue_add(robot_id: str):
   return jsonify({"success": ok})
 
 
+@app.post("/api/robots/<robot_id>/initialpose")
+def api_robot_initialpose(robot_id: str):
+  if kitchen_manager is None:
+    return jsonify({"success": False, "error": "kitchen mode not enabled"}), 400
+  client = kitchen_manager.clients.get(robot_id)
+  if client is None:
+    return jsonify({"success": False, "error": "unknown robot"}), 404
+  data = request.get_json() or {}
+  try:
+    ok = client.set_initial_pose(
+      float(data["x"]),
+      float(data["y"]),
+      float(data.get("yaw", 0.0)),
+    )
+  except (KeyError, TypeError, ValueError):
+    return jsonify({"success": False, "error": "invalid payload"}), 400
+  return jsonify({"success": ok})
+
+
 @app.post("/api/robots/<robot_id>/nav/stop")
 def api_robot_nav_stop(robot_id: str):
   if kitchen_manager is None:
@@ -1169,14 +1199,14 @@ def parse_args():
   parser.add_argument('--classify-dominance-ratio', type=float, default=1.25,
                       help='Winner score must exceed runner-up total by this ratio')
   parser.add_argument('--fine-approach-enabled', action=argparse.BooleanOptionalAction, default=True)
-  parser.add_argument('--align-timeout', type=float, default=25.0)
+  parser.add_argument('--align-timeout', type=float, default=10.0)
   parser.add_argument('--approach-timeout', type=float, default=20.0)
   parser.add_argument('--align-tolerance-px', type=float, default=20.0)
   parser.add_argument('--align-angular-speed', type=float, default=0.4)
   parser.add_argument('--approach-linear-speed', type=float, default=0.06)
   parser.add_argument('--ultrasonic-stop-distance', type=float, default=0.10,
                       help='Stop forward approach when ultrasonic range falls below this (m)')
-  parser.add_argument('--stalled-timeout', type=float, default=5.0,
+  parser.add_argument('--stalled-timeout', type=float, default=10.0,
                       help='Fail pose navigation if the robot stays still this long (s)')
   parser.add_argument('--stalled-move-tolerance', type=float, default=0.03,
                       help='Pose movement below this distance (m) counts as stopped')

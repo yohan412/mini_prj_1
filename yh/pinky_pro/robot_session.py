@@ -27,10 +27,10 @@ import cv2
 from ultralytics import YOLO
 
 from classify_zones import ClassifyZone, allows_classification
-from lidar_object_tracker import LidarCluster
+from cluster_class_voter import ClusterClassVoter
+from lidar_object_tracker import LidarCluster, MapObject
 from yolo_nav_fusion import (
   dedupe_same_class_detections,
-  detection_bearing_robot,
   match_detection_to_cluster,
   parse_yolo_results,
 )
@@ -47,6 +47,9 @@ class RobotSessionConfig:
   match_angle_deg: float = 10.0
   cam_yaw_offset: float = 0.0
   label_confidence: float = 0.8
+  classify_interval: float = 3.0
+  classify_min_score: float = 2.0
+  classify_dominance_ratio: float = 1.25
   # Empty list = allow class labeling everywhere on the map.
   classify_zones: list[ClassifyZone] | None = None
 
@@ -55,11 +58,89 @@ class RobotSessionConfig:
   yolo_hz: float = 15.0
 
 
+class BridgeTrackerView:
+  """Read-only tracker view backed by the latest RobotBridge /api/state."""
+
+  def __init__(self) -> None:
+    self._objects: dict[str, MapObject] = {}
+
+  def sync_from_state(self, state: dict[str, Any]) -> None:
+    objects: dict[str, MapObject] = {}
+    for raw in state.get("tracker_objects") or []:
+      try:
+        obj_id = str(raw["id"])
+        objects[obj_id] = MapObject(
+          id=obj_id,
+          map_x=float(raw["map_x"]),
+          map_y=float(raw["map_y"]),
+          distance=float(raw.get("distance") or 0.0),
+          bearing_deg=float(raw.get("bearing_deg") or 0.0),
+          obj_class=raw.get("class"),
+          confidence=float(raw.get("confidence") or 0.0),
+          locked=bool(raw.get("locked")),
+          last_seen=float(raw.get("last_seen") or time.time()),
+        )
+      except (KeyError, TypeError, ValueError):
+        continue
+    self._objects = objects
+
+  def get_object_by_id(self, object_id: str) -> Optional[MapObject]:
+    return self._objects.get(object_id)
+
+  def find_object_near(
+    self,
+    map_x: float,
+    map_y: float,
+    tolerance: Optional[float] = None,
+  ) -> Optional[MapObject]:
+    tol = 0.2 if tolerance is None else tolerance
+    best: Optional[MapObject] = None
+    best_dist = tol
+    for obj in self._objects.values():
+      dist = math.hypot(obj.map_x - map_x, obj.map_y - map_y)
+      if dist <= best_dist:
+        best_dist = dist
+        best = obj
+    return best
+
+  def find_canonical_vote_target(
+    self,
+    map_x: float,
+    map_y: float,
+    class_name: str,
+  ) -> Optional[MapObject]:
+    tol = 0.35
+    cls = class_name.lower()
+    candidates: list[MapObject] = []
+    for obj in self._objects.values():
+      if math.hypot(obj.map_x - map_x, obj.map_y - map_y) > tol:
+        continue
+      if cls and obj.locked and obj.obj_class != cls:
+        continue
+      candidates.append(obj)
+    if not candidates:
+      return None
+
+    def sort_key(obj: MapObject) -> tuple[int, float]:
+      locked_same = int(obj.locked and obj.obj_class == cls)
+      dist = math.hypot(obj.map_x - map_x, obj.map_y - map_y)
+      return (-locked_same, dist)
+
+    return min(candidates, key=sort_key)
+
+
 class RobotSession:
   def __init__(self, cfg: RobotSessionConfig, model: YOLO):
     self.cfg = cfg
     self.model = model
     self.model_names = {int(k): v for k, v in self.model.names.items()}
+    self.class_voter = ClusterClassVoter(
+      interval_sec=cfg.classify_interval,
+      min_vote_score=cfg.classify_min_score,
+      min_vote_confidence=cfg.label_confidence,
+      dominance_ratio=cfg.classify_dominance_ratio,
+    )
+    self._tracker_view = BridgeTrackerView()
 
     self._lock = threading.Lock()
     self._latest_state: dict[str, Any] | None = None
@@ -105,6 +186,7 @@ class RobotSession:
         if isinstance(state, dict):
           with self._lock:
             self._latest_state = state
+          self._tracker_view.sync_from_state(state)
       except (urllib.error.URLError, TimeoutError, ValueError):
         pass
       time.sleep(interval)
@@ -127,6 +209,20 @@ class RobotSession:
       except Exception:
         continue
     return clusters
+
+  def _resolve_vote_target(
+    self,
+    cluster: LidarCluster,
+    class_name: str,
+  ) -> Optional[MapObject]:
+    target = self._tracker_view.find_canonical_vote_target(
+      cluster.map_x,
+      cluster.map_y,
+      class_name,
+    )
+    if target is None:
+      target = self._tracker_view.find_object_near(cluster.map_x, cluster.map_y)
+    return target
 
   def _push_label(self, map_x: float, map_y: float, cls: str, conf: float) -> None:
     try:
@@ -158,6 +254,7 @@ class RobotSession:
       pose = state["pose"]
       robot_yaw = float(pose.get("yaw") or 0.0)
       clusters = self._clusters_from_state(state)
+      self._tracker_view.sync_from_state(state)
 
       h, w = frame.shape[:2]
       results = self.model(
@@ -172,6 +269,8 @@ class RobotSession:
       detections = dedupe_same_class_detections(detections)
 
       used_cluster_keys: set[tuple[float, float]] = set()
+      vote_winners: dict[tuple[str, tuple[float, float]], tuple[Any, LidarCluster, str]] = {}
+
       for det in detections:
         cluster = match_detection_to_cluster(
           det,
@@ -191,8 +290,27 @@ class RobotSession:
         if not allows_classification(cluster.map_x, cluster.map_y, zones):
           continue
 
-        used_cluster_keys.add((round(cluster.map_x, 3), round(cluster.map_y, 3)))
-        self._push_label(cluster.map_x, cluster.map_y, det.class_name, det.confidence)
+        cluster_key = (round(cluster.map_x, 3), round(cluster.map_y, 3))
+        used_cluster_keys.add(cluster_key)
+        target = self._resolve_vote_target(cluster, det.class_name)
+        if target is None:
+          continue
+
+        vote_key = (det.class_name, cluster_key)
+        prev = vote_winners.get(vote_key)
+        if prev is None or det.confidence > prev[0].confidence:
+          vote_winners[vote_key] = (det, cluster, target.id)
+
+      for det, cluster, target_id in vote_winners.values():
+        self.class_voter.record_match(target_id, det.class_name, det.confidence)
+
+      for update in self.class_voter.compute_label_updates(self._tracker_view):
+        self._push_label(
+          float(update["map_x"]),
+          float(update["map_y"]),
+          str(update["class"]),
+          float(update["confidence"]),
+        )
 
       plotted = results[0].plot()
       ok2, encoded = cv2.imencode(".jpg", plotted, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
@@ -203,4 +321,3 @@ class RobotSession:
       time.sleep(interval)
 
     cap.release()
-

@@ -165,17 +165,31 @@ class ClusterClassVoter:
     obj_id: str,
     now: float,
   ) -> Optional[tuple[str, float, float, dict[str, float]]]:
+    records = [
+      r for r in self._votes.get(obj_id, [])
+      if r.timestamp >= now - self.interval_sec
+    ]
+    if not records:
+      return None
+
     scores = self.get_pending_scores(obj_id)
-    if not scores:
-      return None
+    existing = self._labels.get(obj_id)
 
-    best_class, best_score = max(scores.items(), key=lambda item: item[1])
-    if best_score < self.min_vote_score:
-      return None
+    if existing is not None:
+      latest = max(records, key=lambda item: item.timestamp)
+      if latest.confidence >= self.min_vote_confidence:
+        best_class = latest.class_name
+        best_score = scores.get(best_class, latest.confidence)
+      else:
+        best_class, best_score = max(scores.items(), key=lambda item: item[1])
+    else:
+      best_class, best_score = max(scores.items(), key=lambda item: item[1])
+      if best_score < self.min_vote_score:
+        return None
 
-    other_score = sum(score for cls, score in scores.items() if cls != best_class)
-    if other_score > 0.0 and best_score < other_score * self.dominance_ratio:
-      return None
+      other_score = sum(score for cls, score in scores.items() if cls != best_class)
+      if other_score > 0.0 and best_score < other_score * self.dominance_ratio:
+        return None
 
     vote_count = sum(
       1 for r in self._votes.get(obj_id, [])
@@ -183,6 +197,58 @@ class ClusterClassVoter:
     )
     avg_conf = best_score / max(vote_count, 1)
     return best_class, best_score, avg_conf, scores
+
+  def compute_label_updates(
+    self,
+    tracker: LidarObjectTracker,
+    *,
+    now: Optional[float] = None,
+  ) -> list[dict[str, object]]:
+    """Return label updates without mutating tracker (for remote bridge sync)."""
+    now = time.time() if now is None else now
+    self._prune(now)
+    self._prune_stale_labels(tracker)
+    if (now - self._last_eval) < self.interval_sec:
+      return []
+    self._last_eval = now
+
+    updated: list[dict[str, object]] = []
+    candidate_ids = set(self._votes.keys()) | set(self._labels.keys())
+
+    for obj_id in candidate_ids:
+      obj = tracker.get_object_by_id(obj_id)
+      if obj is None:
+        continue
+
+      result = self._evaluate_scores(obj_id, now)
+      if result is None:
+        continue
+
+      best_class, best_score, avg_conf, scores = result
+      prev = self._labels.get(obj_id)
+      label = ObjectLabel(
+        object_id=obj_id,
+        class_name=best_class,
+        score=best_score,
+        confidence=avg_conf,
+        scores=dict(scores),
+        updated_at=now,
+        labeled=True,
+      )
+      self._labels[obj_id] = label
+      updated.append({
+        'id': obj_id,
+        'class': best_class,
+        'score': best_score,
+        'confidence': avg_conf,
+        'scores': dict(scores),
+        'map_x': obj.map_x,
+        'map_y': obj.map_y,
+        'labeled': True,
+        'refreshed': prev is not None,
+      })
+
+    return updated
 
   def evaluate(self, tracker: LidarObjectTracker) -> list[dict[str, object]]:
     """Confirm or refresh labels every interval_sec from accumulated vote scores."""
