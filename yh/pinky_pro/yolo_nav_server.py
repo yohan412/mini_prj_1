@@ -216,6 +216,9 @@ class KitchenManager:
         bridge_url=bridge_url,
         stream_url=stream_url,
         label_confidence=float(params.get("label_confidence") or 0.8),
+        classify_interval=float(params.get("classify_interval") or 3.0),
+        classify_min_score=float(params.get("classify_min_score") or 2.0),
+        classify_dominance_ratio=float(params.get("classify_dominance_ratio") or 1.25),
         classify_zones=parse_classify_zones(zones_raw),
       )
       session = RobotSession(s_cfg, self.model)

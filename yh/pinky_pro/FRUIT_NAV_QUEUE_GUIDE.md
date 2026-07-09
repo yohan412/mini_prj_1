@@ -144,7 +144,7 @@ YOLO 모델 (`best.pt`)가 프로젝트 루트에 있어야 합니다. 클래스
 
 ## 6. 실행 가이드
 
-### 6-1. 로봇 (3터미널)
+### 6-1. 로봇 (4~5터미널)
 
 ```bash
 # 터미널 1 — 로봇 bringup (LiDAR, 모터, TF)
@@ -167,6 +167,27 @@ ros2 launch pinky_navigation web_nav2.launch.xml \
   map:=$(ros2 pkg prefix pinky_navigation)/share/pinky_navigation/map/mini_prj_map.yaml
 ```
 
+#### 터미널 4 — 초음파 센서 (fruit 미세 접근 시 필수)
+
+`bringup_robot.launch.xml`에는 **포함되지 않음**. raspi/aarch64에서 빌드·실행:
+
+```bash
+cd ~/pinky_pro
+source install/setup.bash
+colcon build --packages-select pinky_sensor_adc   # 최초 1회
+source install/setup.bash
+ros2 run pinky_sensor_adc main_node
+```
+
+확인: `ros2 topic info /us_sensor/range -v` → Publisher `pinky_sensor_adc`
+
+> 없으면 fruit 큐가 `Waiting for ultrasonic...` → `Approach timeout` 으로 실패합니다.
+
+#### (주방 모드) 터미널 5 — robot_bridge
+
+멀티로봇 주방(`--config kitchen_config.yaml`)은 PC가 아닌 **로봇에서** `robot_bridge.py`를 실행합니다.  
+로봇 코드 동기화·5터미널 절차·API는 **`KITCHEN_MULTI_ROBOT_GUIDE.md` §6** 참고.
+
 ### 6-2. 제어 PC
 
 ```bash
@@ -187,11 +208,19 @@ python3 yolo_nav_server.py \
 ### 6-3. 초기 설정 순서 (권장)
 
 1. 로봇 bringup + Nav2 + 카메라 스트림 실행
-2. PC에서 `ros2 topic echo /scan --once` 로 LiDAR 수신 확인
-3. 브라우저 `:8090` → 맵에서 **Set Initial Pose** 로 AMCL 초기 위치 설정
-4. **현재 위치를 처음 위치로 저장** (Home)
-5. 과일이 보이면 맵에 객체 마커 표시 확인
-6. 과일 버튼으로 큐에 명령 추가
+2. **(fruit 미세 접근)** `pinky_sensor_adc main_node` 실행 → `ros2 topic info /us_sensor/range -v` Publisher 1 확인
+3. PC에서 `ros2 topic echo /scan --once` 로 LiDAR 수신 확인
+4. 브라우저 `:8090` → 맵에서 **Set Initial Pose** 로 AMCL 초기 위치 설정
+5. **현재 위치를 처음 위치로 저장** (Home)
+6. 과일이 보이면 맵에 객체 마커 표시 확인
+7. 과일 버튼으로 큐에 명령 추가
+
+실행 후 점검:
+
+```bash
+ros2 topic info /us_sensor/range -v    # Publisher: pinky_sensor_adc
+ros2 node info /yolo_nav_server | grep cmd_vel   # 단일 PC: /cmd_vel_nav
+```
 
 ---
 
@@ -264,6 +293,15 @@ Home pose 저장 경로: `~/.pinky_pro/home_pose.json`
 | `--object-match-angle` | `10.0` | YOLO-LiDAR 매칭 각도 (deg) |
 | `--object-ttl` | `10.0` | 미감지 객체 유지 시간 (s) |
 | `--map-match-tolerance` | `0.2` | 동일 객체 판정 거리 (m) |
+| `--align-timeout` | `10.0` | LiDAR align 최대 시간 (s) |
+| `--stalled-timeout` | `10.0` | stall 판정 (s) |
+| `--approach-timeout` | `20.0` | 초음파 approach 최대 시간 (s) |
+| `--ultrasonic-stop-distance` | `0.10` | 초음파 최종 정지 (m) |
+| `--approach-linear-speed` | `0.06` | approach 전진 속도 (m/s) |
+
+Fruit 미세 접근: Nav2 → **align**(LiDAR+초음파 거리) → **approach**(초음파 ≤ stop distance).  
+단일 PC 모드: `yolo_nav_server`가 `/cmd_vel` publish.  
+주방 `robot_bridge` 모드: **`/cmd_vel_nav`** publish (Nav2 velocity_smoother 경유).
 
 ---
 
@@ -276,6 +314,8 @@ Home pose 저장 경로: `~/.pinky_pro/home_pose.json`
 | YOLO 영상 없음 | `curl http://192.168.4.1:5000/health`, 카메라 점유 프로세스 확인 |
 | 과일 마커 없음 | AMCL initial pose 설정, LiDAR가 과일 높이에서 hit 하는지 확인 |
 | fruit 명령 failed | 30s 내 YOLO+LiDAR 매칭 실패 — 과일이 카메라/LiDAR 시야에 있는지 확인 |
+| `Waiting for ultrasonic` | `pinky_sensor_adc` 미실행 — `ros2 topic info /us_sensor/range -v` |
+| `Approach timeout` | 초음파 invalid 또는 전진 실패 — range 0.03~2.5m, `/cmd_vel_nav` 확인 |
 | goal 충돌 | 8080과 8090 동시 goal 사용 금지 |
 | `best.pt` 없음 | 학습 모델 배치 또는 `--model yolov8n.pt` (클래스 불일치 주의) |
 | 빌드 후 맵 못 찾음 | `install/pinky_navigation/share/pinky_navigation/map/` 에 pgm/yaml 존재 확인 |
@@ -301,6 +341,8 @@ ros2 topic echo /scan --once
 - [ ] `colcon build --packages-select pinky_bringup pinky_navigation` 완료
 - [ ] `install/.../map/mini_prj_map.yaml` 존재
 - [ ] 로봇 `bringup_robot` + `camera_stream` + `web_nav2` 실행
+- [ ] (fruit 미세 접근) `pinky_sensor_adc main_node` 실행, `/us_sensor/range` **Publisher 1** (list만 있고 Publisher 0이면 무효)
+- [ ] (주방 모드) `KITCHEN_MULTI_ROBOT_GUIDE.md` — 로봇 5터미널 + 코드 동기화 + `/cmd_vel_nav` publish 확인
 - [ ] PC `ROS_DOMAIN_ID` 로봇과 동일
 - [ ] `best.pt` 준비 (apple/banana/orange/carrot)
 - [ ] `yolo_nav_server.py` 실행 → `:8090` 접속
