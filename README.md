@@ -4,6 +4,8 @@
 
 단일 로봇 과일 내비게이션과, 역할이 나뉜 **2대 로봇 주방 오케스트레이션**을 지원합니다.
 
+코드 위치: [`pinky_pro/`](./pinky_pro/)
+
 ---
 
 ## 목차
@@ -244,27 +246,29 @@ stateDiagram-v2
 ## 5. 디렉터리 구조
 
 ```
-yh/pinky_pro/
-├── yolo_nav_server.py        # PC 메인: Flask API, kitchen/단일 모드
-├── yolo_nav.html             # 웹 UI (맵·영상·큐·주문)
-├── robot_bridge.py           # 로봇 로컬 HTTP 브리지 (Nav2/LiDAR/큐)
-├── robot_session.py          # 로봇별 YOLO 세션 + 라벨 전송
-├── recipe_orchestrator.py    # 요리 주문 워크플로
-├── kitchen_config.yaml       # 멀티로봇 설정
-├── command_queue.py          # FIFO 명령 큐
-├── lidar_object_tracker.py   # LiDAR 클러스터 → map object
-├── yolo_nav_fusion.py        # YOLO ↔ LiDAR 융합
-├── cluster_class_voter.py    # 클래스 투표
-├── classify_zones.py         # 맵 구역 기반 라벨 허용
-├── fruit_final_approach.py   # align / ultrasonic approach
-├── train_yolo.py             # YOLO 학습 스크립트
-├── yolo_stream_viewer.py     # HTTP YOLO 뷰어 (단독)
-├── yolo_ros_viewer.py        # ROS 토픽 YOLO 뷰어 (레거시)
-├── yolo_test.py              # 로컬 카메라 YOLO 테스트
-├── best.pt / yolo26n.pt      # 학습·베이스 가중치
-├── mini_prj_map*.{pgm,yaml}  # 맵 (inner/outer 포함)
-├── dataset/                  # YOLO 학습 데이터셋
-└── *.md                      # 세부 가이드 문서
+yh/
+├── README.md                 # 본 문서
+└── pinky_pro/
+    ├── yolo_nav_server.py        # PC 메인: Flask API, kitchen/단일 모드
+    ├── yolo_nav.html             # 웹 UI (맵·영상·큐·주문)
+    ├── robot_bridge.py           # 로봇 로컬 HTTP 브리지 (Nav2/LiDAR/큐)
+    ├── robot_session.py          # 로봇별 YOLO 세션 + 라벨 전송
+    ├── recipe_orchestrator.py    # 요리 주문 워크플로
+    ├── kitchen_config.yaml       # 멀티로봇 설정
+    ├── command_queue.py          # FIFO 명령 큐
+    ├── lidar_object_tracker.py   # LiDAR 클러스터 → map object
+    ├── yolo_nav_fusion.py        # YOLO ↔ LiDAR 융합
+    ├── cluster_class_voter.py    # 클래스 투표
+    ├── classify_zones.py         # 맵 구역 기반 라벨 허용
+    ├── fruit_final_approach.py   # align / ultrasonic approach
+    ├── train_yolo.py             # YOLO 학습 스크립트
+    ├── yolo_stream_viewer.py     # HTTP YOLO 뷰어 (단독)
+    ├── yolo_ros_viewer.py        # ROS 토픽 YOLO 뷰어 (레거시)
+    ├── yolo_test.py              # 로컬 카메라 YOLO 테스트
+    ├── best.pt / yolo26n.pt      # 학습·베이스 가중치
+    ├── mini_prj_map*.{pgm,yaml}  # 맵 (inner/outer 포함)
+    ├── dataset/                  # YOLO 학습 데이터셋
+    └── *.md                      # 세부 가이드 문서
 ```
 
 ---
@@ -301,6 +305,12 @@ yh/pinky_pro/
 - 제어 PC: Python3, Ultralytics YOLO, OpenCV, Flask, PyYAML
 - 로봇·PC 동일 WiFi, (단일 모드 시) `ROS_DOMAIN_ID` 일치
 - 로봇: bringup, Nav2(AMCL), 카메라 스트림, 초음파(`/us_sensor/range`) 동작
+
+작업 디렉터리:
+
+```bash
+cd ~/mini_prj/mini_prj_1/yh/pinky_pro
+```
 
 ### 7.1 주방 모드 (2대)
 
@@ -339,7 +349,7 @@ python3 train_yolo.py --data dataset/data.yaml
 
 ## 8. 설정
 
-`kitchen_config.yaml`에서 로봇 URL, 교환 좌표, 레시피, 구역을 코드 수정 없이 변경합니다.
+`pinky_pro/kitchen_config.yaml`에서 로봇 URL, 교환 좌표, 레시피, 구역을 코드 수정 없이 변경합니다.
 
 ```yaml
 robots:
@@ -368,11 +378,11 @@ orchestrator:
 
 | 문서 | 내용 |
 |------|------|
-| [KITCHEN_MULTI_ROBOT_GUIDE.md](./KITCHEN_MULTI_ROBOT_GUIDE.md) | 멀티로봇 주방 실행·점검 절차 |
-| [KITCHEN_ORCHESTRATION_PRESENTATION.md](./KITCHEN_ORCHESTRATION_PRESENTATION.md) | 발표용 아키텍처·시나리오 |
-| [FRUIT_NAV_QUEUE_GUIDE.md](./FRUIT_NAV_QUEUE_GUIDE.md) | 단일 로봇 과일 내비·명령 큐 |
-| [HTTP_CAMERA_YOLO_GUIDE.md](./HTTP_CAMERA_YOLO_GUIDE.md) | HTTP MJPEG + YOLO |
-| [CAMERA_STREAMING_GUIDE.md](./CAMERA_STREAMING_GUIDE.md) | ROS 토픽 카메라 스트리밍 (레거시) |
+| [KITCHEN_MULTI_ROBOT_GUIDE.md](./pinky_pro/KITCHEN_MULTI_ROBOT_GUIDE.md) | 멀티로봇 주방 실행·점검 절차 |
+| [KITCHEN_ORCHESTRATION_PRESENTATION.md](./pinky_pro/KITCHEN_ORCHESTRATION_PRESENTATION.md) | 발표용 아키텍처·시나리오 |
+| [FRUIT_NAV_QUEUE_GUIDE.md](./pinky_pro/FRUIT_NAV_QUEUE_GUIDE.md) | 단일 로봇 과일 내비·명령 큐 |
+| [HTTP_CAMERA_YOLO_GUIDE.md](./pinky_pro/HTTP_CAMERA_YOLO_GUIDE.md) | HTTP MJPEG + YOLO |
+| [CAMERA_STREAMING_GUIDE.md](./pinky_pro/CAMERA_STREAMING_GUIDE.md) | ROS 토픽 카메라 스트리밍 (레거시) |
 
 ---
 
