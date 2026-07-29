@@ -196,7 +196,7 @@ class KitchenManager:
     self.exchange: dict[str, ExchangePose] = {}
 
     for robot_id, rcfg in robots.items():
-      role = str(rcfg.get("role") or "")
+      role = str(rcfg.get("role") or "").strip().lower()
       bridge_url = str(rcfg.get("bridge_url") or "")
       stream_url = str(rcfg.get("stream_url") or "")
       ex = rcfg.get("exchange_pose") or {}
@@ -225,8 +225,7 @@ class KitchenManager:
       session.start()
       self.sessions[robot_id] = session
 
-    supplier_id = next((rid for rid, c in self.clients.items() if c.role == "supplier"), None)
-    server_id = next((rid for rid, c in self.clients.items() if c.role == "server"), None)
+    supplier_id, server_id = self._resolve_supplier_server_ids(cfg)
     if not supplier_id or not server_id:
       raise RuntimeError("config must define one supplier and one server robot")
 
@@ -254,6 +253,37 @@ class KitchenManager:
     self._exchange_saved: dict[str, bool] = {rid: False for rid in self.exchange}
     self._load_saved_exchange_poses()
     self._sync_orchestrator_exchange()
+
+  @staticmethod
+  def _resolve_supplier_server_ids(cfg: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    """Resolve supplier/server robot ids from orchestrator override or per-robot role."""
+    robots = cfg.get("robots") or {}
+    orch = cfg.get("orchestrator") or {}
+    explicit_supplier = str(orch.get("supplier_robot") or "").strip()
+    explicit_server = str(orch.get("server_robot") or "").strip()
+    if explicit_supplier and explicit_server:
+      if explicit_supplier not in robots or explicit_server not in robots:
+        raise RuntimeError(
+          "orchestrator.supplier_robot / server_robot must match robots.* keys"
+        )
+      return explicit_supplier, explicit_server
+
+    supplier_id = next(
+      (rid for rid, rcfg in robots.items() if str(rcfg.get("role") or "").strip().lower() == "supplier"),
+      None,
+    )
+    server_id = next(
+      (rid for rid, rcfg in robots.items() if str(rcfg.get("role") or "").strip().lower() == "server"),
+      None,
+    )
+    return supplier_id, server_id
+
+  def _sync_orchestrator_exchange(self) -> None:
+    supplier_id, server_id = self._resolve_supplier_server_ids(self.raw_cfg)
+    if supplier_id:
+      self.orchestrator.exchange_pose_supplier = self.exchange[supplier_id]
+    if server_id:
+      self.orchestrator.exchange_pose_server = self.exchange[server_id]
 
   @staticmethod
   def _load_exchange_poses_file() -> dict[str, Any]:
@@ -294,14 +324,6 @@ class KitchenManager:
       except (KeyError, TypeError, ValueError):
         continue
 
-  def _sync_orchestrator_exchange(self) -> None:
-    supplier_id = next((rid for rid, c in self.clients.items() if c.role == 'supplier'), None)
-    server_id = next((rid for rid, c in self.clients.items() if c.role == 'server'), None)
-    if supplier_id:
-      self.orchestrator.exchange_pose_supplier = self.exchange[supplier_id]
-    if server_id:
-      self.orchestrator.exchange_pose_server = self.exchange[server_id]
-
   def get_exchange_pose(self, robot_id: str) -> dict[str, Any]:
     ex = self.exchange.get(robot_id)
     if ex is None:
@@ -316,6 +338,12 @@ class KitchenManager:
   def enrich_robot_state(self, robot_id: str, state: dict[str, Any]) -> dict[str, Any]:
     merged = dict(state)
     merged['exchange_pose'] = self.get_exchange_pose(robot_id)
+    session = self.sessions.get(robot_id)
+    if session is not None and hasattr(session, "get_video_debug"):
+      try:
+        merged["video_debug"] = session.get_video_debug()
+      except Exception:
+        pass
     return merged
 
   def save_exchange_pose(self, robot_id: str) -> dict[str, Any]:
@@ -947,8 +975,29 @@ def _robot_mjpeg_generator(robot_id: str):
   while True:
     frame = kitchen_manager.get_robot_frame(robot_id) if kitchen_manager else None
     if frame is None:
-      time.sleep(0.05)
-      continue
+      # Provide a placeholder frame so browsers don't stay on an empty/black loading state.
+      try:
+        import numpy as np  # type: ignore
+        import cv2  # type: ignore
+        img = np.zeros((240, 320, 3), dtype=np.uint8)
+        cv2.putText(
+          img,
+          f"No video frame: {robot_id}",
+          (10, 60),
+          cv2.FONT_HERSHEY_SIMPLEX,
+          0.6,
+          (0, 255, 255),
+          2,
+          cv2.LINE_AA,
+        )
+        ok, encoded = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        if ok:
+          frame = encoded.tobytes()
+      except Exception:
+        frame = None
+      if frame is None:
+        time.sleep(0.1)
+        continue
     yield boundary + b"\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
     time.sleep(1.0 / 15.0)
 
